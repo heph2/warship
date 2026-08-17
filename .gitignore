@@ -1,0 +1,14 @@
+# direnv
+.direnv/
+
+# Build artifacts
+/build/
+*.o
+*.a
+*.so
+*.out
+a.out
+
+# Editor / tooling
+compile_commands.json
+.cache/
