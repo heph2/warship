@@ -213,7 +213,14 @@ int main(int argc, char **argv) {
       struct timespec ts = {.tv_nsec = 50000000};
       nanosleep(&ts, NULL);
     }
-    if (!strcmp(net_route(n), "unknown")) {
+    const char *groute = net_route(n);
+    for (long long deadline = now_ms() + 3000;
+         !strcmp(groute, "unknown") && now_ms() < deadline;) {
+      struct timespec ts = {.tv_nsec = 50000000};
+      nanosleep(&ts, NULL);
+      groute = net_route(n);
+    }
+    if (!strcmp(groute, "unknown")) {
       fprintf(stderr, "guest: no route reported\n");
       _exit(1);
     }
@@ -259,8 +266,20 @@ int main(int argc, char **argv) {
       got = 1;
   }
 
-  printf("route: %s\n", net_route(n));
-  assert(strcmp(net_route(n), "unknown"));
+  // The selected pair can take a moment to become readable after COMPLETED,
+  // so let the route settle instead of latching whatever the first call says.
+  // Sleep between attempts: spinning on net_route() hammers libjuice's lock
+  // and starves the very thread that has to publish the selected pair.
+  const char *route = net_route(n);
+  for (long long deadline = now_ms() + 3000;
+       !strcmp(route, "unknown") && now_ms() < deadline;) {
+    struct timespec ts = {.tv_nsec = 50000000};
+    nanosleep(&ts, NULL);
+    route = net_route(n);
+  }
+
+  printf("route: %s\n", route);
+  assert(strcmp(route, "unknown"));
   assert(net_alive(n));
 
   int closed = signaling_is_closed(room);

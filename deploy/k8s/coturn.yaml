@@ -72,6 +72,11 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+              # turnserver carries a file capability, and execve of such a
+              # binary fails with EPERM when the bounding set is empty. We do
+              # not need the capability -- 3478 is above 1024 -- but it has to
+              # be in the bounding set for the binary to start at all.
+              add: ["NET_BIND_SERVICE"]
       volumes:
         - name: config
           configMap:

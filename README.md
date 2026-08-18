@@ -45,7 +45,8 @@ coturn relay candidate.
 - **coturn** is the only relay. If no path exists at all, you get a clean error
   rather than a silent fallback.
 
-The status line reports which path won: `host`, `port-mapped`, `srflx` or `relay`.
+The status line reports which path won: `host`, `prflx`, `port-mapped`, `srflx`
+or `relay`. Only `relay` means a third machine sees the packets.
 
 ## Server
 

@@ -86,6 +86,20 @@ checking the room no longer exists.
   a shape the product never has, and the tests fork rather than try.
 - Loopback ICE completes in roughly a millisecond, so timing knobs are a poor
   way to force a particular path in tests.
+- `typ prflx` is a normal outcome, not an anomaly. A peer-reflexive candidate
+  is an address learned from an incoming connectivity check rather than from
+  signaling, and it appears whenever a candidate arrives later than packets
+  sent from it -- roughly 40% of connections through the real deployment, and
+  almost never on loopback. `net_route` must handle it or a perfectly good
+  direct path reports itself as "unknown".
+- `net_route` is briefly "unknown" right after connecting: the selected pair
+  is not immediately readable. Re-read it rather than latching the first
+  answer, and sleep between attempts -- spinning on it starves the libjuice
+  thread that has to publish the pair.
+- The coturn image's turnserver carries a file capability, so `capabilities:
+  drop: ["ALL"]` alone makes execve fail with EPERM and the pod crash-loops
+  with "Operation not permitted". It needs NET_BIND_SERVICE back in the
+  bounding set even though it binds nothing privileged.
 - Signaling ending mid-handshake is **not** a failure. Whoever completes ICE
   first closes its websocket, which collapses the room and hands the other peer
   a `PEERGONE` while it is still finishing. It only means no more candidates

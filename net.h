@@ -63,8 +63,10 @@ int net_recv(Net *n, char *buf, int cap);
 
 int net_alive(const Net *n);
 
-// "host", "port-mapped" (the router opened a port for us), "srflx" or "relay"
-// (a coturn allocation).
+// The path in use: "host", "prflx" (peer-reflexive, still direct),
+// "port-mapped" (the router opened a port for us), "srflx", or "relay" (a
+// coturn allocation, the only case where a third machine sees the packets).
+// Briefly "unknown" right after connecting, before the pair is readable.
 const char *net_route(const Net *n);
 void net_close(Net *n);
 const char *net_error(void);

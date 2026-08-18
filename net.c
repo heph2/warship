@@ -189,15 +189,27 @@ int net_alive(const Net *n) {
 const char *net_route(const Net *n) {
   static char local[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
   static char remote[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
+  // "unknown" is not always permanent: the selected pair can be briefly
+  // unavailable immediately after ICE reports COMPLETED. Callers that display
+  // the route should re-read it rather than latching the first answer.
   if (juice_get_selected_candidates(n->agent, local, sizeof local, remote,
                                     sizeof remote) != 0)
     return "unknown";
+
+  // Most specific first: a relayed pair is relayed however the other side is
+  // described.
   if (strstr(local, "typ relay") || strstr(remote, "typ relay"))
     return "relay";
   if (strstr(local, "candidate:map") || strstr(remote, "candidate:map"))
     return "port-mapped";
   if (strstr(local, "typ srflx") || strstr(remote, "typ srflx"))
     return "srflx";
+  // Peer-reflexive: an address learned from an incoming connectivity check
+  // rather than from signaling, which happens whenever a candidate arrives
+  // later than the packets sent from it. Still a direct path. Leaving this out
+  // made a perfectly good direct connection report itself as "unknown".
+  if (strstr(local, "typ prflx") || strstr(remote, "typ prflx"))
+    return "prflx";
   if (strstr(local, "typ host") && strstr(remote, "typ host"))
     return "host";
   return "unknown";
