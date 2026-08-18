@@ -81,7 +81,11 @@ int signal_send(Signal *s, const char *verb, const char *payload) {
 
   int off = 0;
   while (off < n) {
-    ssize_t w = write(s->fd, line + off, (size_t)(n - off));
+    // MSG_NOSIGNAL, not write(): once this socket also carries relayed game
+    // traffic, a server or peer that vanishes would otherwise kill us with
+    // SIGPIPE mid-game. Targeted, so we do not touch the process-wide
+    // disposition on the caller's behalf.
+    ssize_t w = send(s->fd, line + off, (size_t)(n - off), MSG_NOSIGNAL);
     if (w < 0) {
       if (errno == EINTR)
         continue;

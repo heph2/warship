@@ -24,7 +24,8 @@ test_net: $(NET_OBJ) test_net.o
 # Needs a live server, so it stays out of `make test`.
 itest: rendezvous test_signaling test_net
 	@./rendezvous 17778 & pid=$$!; sleep 0.3; \
-	  ./test_signaling 17778 && ./test_net 17778; rc=$$?; \
+	  ./test_signaling 17778 && ./test_net 17778 && ./test_net 17778 relay; \
+	  rc=$$?; \
 	  kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; exit $$rc
 
 # Drives two real processes on ptys through a full turn. Needs python3.

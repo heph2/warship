@@ -13,6 +13,9 @@
 //   -> DESC <blob>        forwarded verbatim to the other peer
 //   -> CAND <candidate>   forwarded verbatim, repeatable (trickle ICE)
 //   -> DONE               forwarded: local candidate gathering finished
+//   -> RELAY <payload>    forwarded: a game datagram, when ICE could not find
+//                         a direct path. This is the relay of last resort, so
+//                         the room has to outlive signaling.
 //   -> BYE
 //
 // Everything arriving here is from an unauthenticated stranger on the open
@@ -38,8 +41,11 @@
 #define MAX_ROOMS 256
 #define LINE_MAX 1024 // must hold a packed ICE description
 #define CODE_LEN 6
-#define LONELY_TIMEOUT_S 60  // no partner showed up
-#define ROOM_LIFETIME_S 300  // signaling should take seconds, not minutes
+#define LONELY_TIMEOUT_S 60 // no partner showed up
+// Rooms used to have a flat lifetime, which was fine when they only carried
+// signaling. Now a room may be relaying a whole game, so it expires on being
+// idle instead -- long enough to think about a move, short enough to reclaim.
+#define ROOM_IDLE_S 900
 
 // No 0/o/1/l/i: codes get read aloud and typed by hand.
 static const char CODE_ALPHABET[] = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -56,7 +62,7 @@ typedef struct {
   int used;
   char code[CODE_LEN + 1];
   int peer[2]; // client indices, -1 when empty
-  long long created_at;
+  long long last_activity;
 } Room;
 
 static Client clients[MAX_CLIENTS];
@@ -132,7 +138,7 @@ static int make_room(int ci) {
     r->used = 1;
     r->peer[0] = ci;
     r->peer[1] = -1;
-    r->created_at = now_s();
+    r->last_activity = now_s();
     return i;
   }
   return -1;
@@ -210,6 +216,7 @@ static void handle_line(int ci, char *line) {
       return;
     }
     rooms[ri].peer[1] = ci;
+    rooms[ri].last_activity = now_s();
     c->room = ri;
     send_line(rooms[ri].peer[0], "PEER host\n");
     send_line(ci, "PEER guest\n");
@@ -217,12 +224,13 @@ static void handle_line(int ci, char *line) {
   }
 
   if (!strncmp(line, "DESC ", 5) || !strncmp(line, "CAND ", 5) ||
-      !strcmp(line, "DONE")) {
+      !strncmp(line, "RELAY ", 6) || !strcmp(line, "DONE")) {
     int peer = other_peer(ci);
     if (peer < 0) {
       send_line(ci, "ERR nopeer\n");
       return;
     }
+    rooms[c->room].last_activity = now_s();
     char msg[LINE_MAX + 2];
     snprintf(msg, sizeof msg, "%s\n", line); // opaque: never inspected
     send_line(peer, msg);
@@ -283,7 +291,7 @@ static void sweep_timeouts(void) {
   for (int i = 0; i < MAX_ROOMS; i++) {
     if (!rooms[i].used)
       continue;
-    if (t - rooms[i].created_at > ROOM_LIFETIME_S) {
+    if (t - rooms[i].last_activity > ROOM_IDLE_S) {
       for (int k = 0; k < 2; k++)
         if (rooms[i].peer[k] >= 0)
           drop_client(rooms[i].peer[k], "ERR expired\n");

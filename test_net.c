@@ -15,11 +15,31 @@
 
 // Wait for one datagram, or give up. Loss is possible in principle even on
 // loopback, so the sender repeats and this just needs the first arrival.
+// A readable descriptor does not imply a datagram: juice also posts state
+// changes on the same pipe. Keep polling until the deadline, exactly as the
+// real loop in main.c does.
 static int recv_wait(Net *n, char *buf, int cap, int timeout_ms) {
-  struct pollfd p = {.fd = net_fd(n), .events = POLLIN};
-  if (poll(&p, 1, timeout_ms) != 1)
-    return 0;
-  return net_recv(n, buf, cap);
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  for (;;) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long elapsed = (now.tv_sec - start.tv_sec) * 1000 +
+                        (now.tv_nsec - start.tv_nsec) / 1000000;
+    int left = timeout_ms - (int)elapsed;
+    if (left <= 0)
+      return 0;
+
+    struct pollfd p[NET_MAX_POLLFDS];
+    int nfds = net_pollfds(n, p, NET_MAX_POLLFDS);
+    if (poll(p, (nfds_t)nfds, left) < 1)
+      return 0;
+
+    int len = net_recv(n, buf, cap);
+    if (len > 0)
+      return len;
+  }
 }
 
 static int code_out_fd = -1;
@@ -33,6 +53,10 @@ static void publish_code(const char *code, void *ctx) {
 
 int main(int argc, char **argv) {
   const char *port = argc > 1 ? argv[1] : "17779";
+  // "relay": skip ICE entirely. A short timeout is not enough -- loopback ICE
+  // completes in roughly a millisecond, so the race is not reliably lost.
+  int force_relay = argc > 2 && !strcmp(argv[2], "relay");
+  const char *want_route = force_relay ? "signal-relay" : "host";
   int code_pipe[2];
   assert(pipe(code_pipe) == 0);
 
@@ -41,7 +65,8 @@ int main(int argc, char **argv) {
 
   NetConfig cfg = {.signal_host = "127.0.0.1",
                    .signal_port = port,
-                   .timeout_ms = 20000};
+                   .timeout_ms = 20000,
+                   .ice_timeout_ms = force_relay ? -1 : 20000};
   char room[64] = "";
   int is_host = -1;
   Net *n = NULL;
@@ -71,6 +96,12 @@ int main(int argc, char **argv) {
       struct timespec ts = {.tv_nsec = 50000000};
       nanosleep(&ts, NULL);
     }
+    // Checked after the exchange, not before: which side notices first is a
+    // race, but once traffic has crossed both must agree on the path.
+    if (strcmp(net_route(n), want_route)) {
+      fprintf(stderr, "guest: route %s, wanted %s\n", net_route(n), want_route);
+      _exit(1);
+    }
     net_close(n);
     _exit(0);
   }
@@ -97,6 +128,7 @@ int main(int argc, char **argv) {
   }
 
   printf("route: %s\n", net_route(n));
+  assert(!strcmp(net_route(n), want_route));
   assert(net_alive(n));
   net_close(n);
 
@@ -106,6 +138,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "handshake failed (got=%d child=%d)\n", got, status);
     return 1;
   }
-  printf("net ok (room %s)\n", room);
+  printf("net ok via %s (room %s)\n", want_route, room);
   return 0;
 }

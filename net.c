@@ -23,9 +23,17 @@
 #define TAG_STATE 'S' // ICE state changed
 
 #define MAX_PENDING 4 // early datagrams held during the handshake
+#define PROTO_LINE_CAP 512 // one relayed message; proto.c caps its lines at 256
+
+// How data actually reaches the peer.
+typedef enum {
+  MODE_ICE,  // direct, or via TURN if one was configured
+  MODE_RELAY // through the rendezvous server we already have a socket to
+} Mode;
 
 struct Net {
   juice_agent_t *agent;
+  Mode mode;
   int pipe[2]; // [0] read by main loop, [1] written by the juice thread
   atomic_int state;
   Signal sig;
@@ -119,9 +127,31 @@ static int sdp_unpack(const char *packed, char *out, int cap) {
 
 // ------------------------------------------------------------------- open ---
 
-int net_fd(const Net *n) { return n->pipe[0]; }
+int net_pollfds(const Net *n, struct pollfd *out, int cap) {
+  int i = 0;
+  if (i < cap && n->pipe[0] >= 0)
+    out[i++] = (struct pollfd){.fd = n->pipe[0], .events = POLLIN};
+  if (i < cap && signal_fd(&n->sig) >= 0)
+    out[i++] = (struct pollfd){.fd = signal_fd(&n->sig), .events = POLLIN};
+  return i;
+}
+
+// Give up on a direct path. Not an error: the game carries on over the relay.
+//
+// Announce it with an empty RELAY line rather than waiting for the first game
+// message. Otherwise a peer whose own ICE succeeded keeps sending into a
+// session we stopped listening to, and only discovers the truth when its
+// retransmits run out.
+static void go_relay(Net *n) {
+  if (n->mode == MODE_RELAY)
+    return;
+  n->mode = MODE_RELAY;
+  signal_send(&n->sig, "RELAY", ""); // payload-free: a mode switch, not data
+}
 
 int net_alive(const Net *n) {
+  if (n->mode == MODE_RELAY)
+    return signal_fd(&n->sig) >= 0;
   int st = atomic_load((atomic_int *)&n->state);
   return st != JUICE_STATE_FAILED && st != JUICE_STATE_DISCONNECTED;
 }
@@ -129,6 +159,8 @@ int net_alive(const Net *n) {
 const char *net_route(const Net *n) {
   static char local[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
   static char remote[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
+  if (n->mode == MODE_RELAY)
+    return "signal-relay";
   if (juice_get_selected_candidates(n->agent, local, sizeof local, remote,
                                     sizeof remote) != 0)
     return "unknown";
@@ -153,6 +185,13 @@ static void stash(Net *n, const char *buf, int len) {
 // when the peer's description was applied.
 static int on_signal_line(Net *n, const char *line, int *got_desc) {
   char sdp[JUICE_MAX_SDP_STRING_LEN];
+
+  // A RELAY line proves the peer gave up on a direct path. Follow it, or we
+  // would keep shouting into an ICE session it has stopped listening to.
+  if (!strncmp(line, "RELAY ", 6)) {
+    go_relay(n);
+    return 1;
+  }
 
   if (!strncmp(line, "DESC ", 5)) {
     if (!sdp_unpack(line + 5, sdp, sizeof sdp)) {
@@ -210,10 +249,8 @@ static int on_pipe_record(Net *n, const char *rec, int len, int connecting) {
     return 1;
   case TAG_STATE: {
     int st = atomic_load(&n->state);
-    if (st == JUICE_STATE_FAILED) {
-      set_err("ICE failed: no route to the peer (try a TURN server)");
-      return 0;
-    }
+    if (st == JUICE_STATE_FAILED)
+      go_relay(n); // no direct path exists; the relay still does
     return 1;
   }
   default:
@@ -314,25 +351,32 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
     goto fail;
   }
 
+  if (cfg->ice_timeout_ms < 0)
+    go_relay(n); // caller does not want a direct path at all
+
   // Whoever describes itself first becomes the ICE controlling agent. If both
   // do it, libjuice logs a role conflict and has to resolve it by tie-breaker.
   // The host offers; the guest answers only after applying the offer.
   int desc_sent = 0, remote_desc = 0;
-  if (*is_host && !offer(n))
+  if (n->mode == MODE_ICE && *is_host && !offer(n))
     goto fail;
   desc_sent = *is_host;
 
-  long long deadline = now_ms() + timeout;
+  // The wait for a human to type the code is over; from here we are only
+  // waiting on machines, and a much shorter budget applies. Running out is not
+  // a failure -- it is the signal to relay instead.
+  long long deadline =
+      now_ms() + (cfg->ice_timeout_ms > 0 ? cfg->ice_timeout_ms : 20000);
   for (;;) {
     int st = atomic_load(&n->state);
-    if (st == JUICE_STATE_COMPLETED)
+    if (st == JUICE_STATE_COMPLETED || n->mode == MODE_RELAY)
       break;
 
-    int wait = (int)(deadline - now_ms());
-    if (wait <= 0) {
-      set_err("timed out waiting for ICE to connect");
-      goto fail;
+    if (now_ms() >= deadline) {
+      go_relay(n);
+      break;
     }
+    int wait = (int)(deadline - now_ms());
 
     struct pollfd fds[2] = {
         {.fd = signal_fd(&n->sig), .events = POLLIN},
@@ -370,7 +414,8 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
     }
   }
 
-  signal_close(&n->sig); // ICE is up; the server has nothing left to do
+  // The signaling socket deliberately stays open for the whole game: it is the
+  // relay of last resort, and it costs one idle TCP connection to keep.
   *out = n;
   return 1;
 
@@ -388,7 +433,27 @@ fail:
 
 // ------------------------------------------------------------------- data ---
 
+// Relayed payloads travel as one signaling line, so the trailing newline that
+// proto.c puts on every message has to come off and go back on again.
+static int relay_send(Net *n, const char *buf, int len) {
+  char payload[PROTO_LINE_CAP];
+  while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+    len--;
+  if (len <= 0 || len >= (int)sizeof payload)
+    return 0;
+  memcpy(payload, buf, (size_t)len);
+  payload[len] = '\0';
+  return signal_send(&n->sig, "RELAY", payload);
+}
+
 int net_send(Net *n, const char *buf, int len) {
+  if (n->mode == MODE_ICE) {
+    int st = atomic_load(&n->state);
+    if (st == JUICE_STATE_FAILED || st == JUICE_STATE_DISCONNECTED)
+      go_relay(n);
+  }
+  if (n->mode == MODE_RELAY)
+    return relay_send(n, buf, len);
   return juice_send(n->agent, buf, (size_t)len) == 0;
 }
 
@@ -407,7 +472,7 @@ int net_recv(Net *n, char *buf, int cap) {
     char rec[1 + NET_MAX_DATAGRAM];
     ssize_t r = read(n->pipe[0], rec, sizeof rec);
     if (r <= 0)
-      return 0; // nothing queued (the fd is only read after poll says ready)
+      break; // the ICE side is drained
     if (rec[0] == TAG_DATA) {
       int len = (int)r - 1;
       if (len > cap)
@@ -416,6 +481,36 @@ int net_recv(Net *n, char *buf, int cap) {
       return len;
     }
     on_pipe_record(n, rec, (int)r, 0); // state changes and late candidates
+  }
+
+  // Then the relay. Reading this even while ICE looks healthy is what lets a
+  // peer that has already given up drag us over to the relay with it.
+  for (;;) {
+    char line[SIGNAL_LINE];
+    int lr = signal_line(&n->sig, line, sizeof line, 0);
+    if (lr == 0)
+      return 0;
+    if (lr < 0) {
+      signal_close(&n->sig);
+      return 0;
+    }
+    if (!strncmp(line, "RELAY ", 6)) {
+      go_relay(n);
+      int len = (int)strlen(line + 6);
+      if (len == 0)
+        continue; // bare marker: the peer switched, there is no datagram here
+      if (len > cap)
+        len = cap;
+      memcpy(buf, line + 6, (size_t)len);
+      return len;
+    }
+    if (!strcmp(line, "PEERGONE") || !strncmp(line, "ERR", 3)) {
+      set_err(line);
+      signal_close(&n->sig);
+      return 0;
+    }
+    int ignored = 0;
+    on_signal_line(n, line, &ignored); // late trickled candidates
   }
 }
 

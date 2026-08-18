@@ -34,6 +34,7 @@ typedef struct {
   int shot_row, shot_col; // the shot we are waiting on
   int is_host;
   int peer_ready;
+  const char *route; // last reported path, so a fallback can be announced
   char status[160];
 } Game;
 
@@ -258,14 +259,26 @@ static void battle_loop(Game *g) {
       g->st = ST_OVER;
     }
 
+    // Falling back to the relay mid-game must be visible. Silence here looks
+    // identical to a hang.
+    const char *route = net_route(g->net);
+    if (route != g->route && strcmp(route, g->route)) {
+      char note[96];
+      snprintf(note, sizeof note, "connection is now via %s", route);
+      say(g, note);
+      g->route = route;
+    }
+
     draw(g);
 
     int timeout = proto_timeout_ms(&g->proto, now);
-    struct pollfd fds[2] = {
-        {.fd = STDIN_FILENO, .events = POLLIN},
-        {.fd = net_fd(g->net), .events = POLLIN},
-    };
-    if (poll(fds, 2, timeout) < 0) {
+    struct pollfd fds[1 + NET_MAX_POLLFDS];
+    fds[0] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
+    // More than one transport descriptor: the ICE pipe and the signaling
+    // socket, which doubles as the relay.
+    int nfds = 1 + net_pollfds(g->net, fds + 1, NET_MAX_POLLFDS);
+
+    if (poll(fds, (nfds_t)nfds, timeout) < 0) {
       if (errno == EINTR)
         continue;
       return;
@@ -278,7 +291,12 @@ static void battle_loop(Game *g) {
       on_key(g, key);
     }
 
-    if (fds[1].revents & POLLIN) {
+    int net_ready = 0;
+    for (int i = 1; i < nfds; i++)
+      if (fds[i].revents & (POLLIN | POLLHUP | POLLERR))
+        net_ready = 1;
+
+    if (net_ready) {
       char buf[NET_MAX_DATAGRAM];
       int len;
       while ((len = net_recv(g->net, buf, sizeof buf)) > 0) {
@@ -417,7 +435,8 @@ int main(int argc, char **argv) {
       .turn_port = turn_port_s ? atoi(turn_port_s) : 0,
       .turn_user = turn_user,
       .turn_pass = turn_pass,
-      .timeout_ms = 300000, // five minutes for a human to type the code
+      .timeout_ms = 300000,   // five minutes for a human to type the code
+      .ice_timeout_ms = 20000, // then relay rather than give up
       .on_room = show_room,
   };
 
@@ -440,7 +459,8 @@ int main(int argc, char **argv) {
   // once the peer has said READY.
   g->is_host = is_host;
   g->st = ST_WAIT_READY;
-  snprintf(g->status, sizeof g->status, "connected over %s", net_route(g->net));
+  g->route = net_route(g->net);
+  snprintf(g->status, sizeof g->status, "connected over %s", g->route);
 
   battle_loop(g);
 
