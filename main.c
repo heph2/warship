@@ -12,7 +12,15 @@
 #include <string.h>
 #include <unistd.h>
 
-#define DEFAULT_SIGNAL_URL "ws://127.0.0.1:7777"
+// Baked in so that `warship host` needs no arguments at all. Every one of
+// these can still be overridden, and "none" disables STUN or TURN outright.
+// *.pochi.casa is IPv6-only, which is also why NAT traversal matters less
+// here than it would on v4: the hosts are globally addressable and the
+// question is firewalls, not translation.
+#define DEFAULT_SIGNAL_URL "wss://signal.pochi.casa/"
+#define DEFAULT_STUN_SERVER "turn.pochi.casa:3478"
+#define DEFAULT_TURN_SERVER "turn.pochi.casa:3478"
+#define DEFAULT_TURN_USER "warship"
 #define DEFAULT_TURN_PORT 3478
 
 typedef enum {
@@ -335,19 +343,25 @@ static void usage(const char *argv0) {
           "  %s host [options]\n"
           "  %s join <code> [options]\n"
           "\n"
+          "With no options at all this uses the pochi.casa deployment:\n"
+          "  signal   %s\n"
+          "  stun     %s\n"
+          "  turn     %s (user %s)\n"
+          "\n"
           "options:\n"
           "  --signal-url URL       ws:// or wss:// signaling service\n"
-          "                         (default %s)\n"
-          "  --stun-server H[:P]    STUN server, default port 3478\n"
-          "  --turn-server H[:P]    TURN relay, repeatable, default port %d\n"
+          "  --stun-server H[:P]    or \"none\"\n"
+          "  --turn-server H[:P]    repeatable, or \"none\"; default port %d\n"
           "  --turn-user USER       or $WARSHIP_TURN_USER\n"
           "  --turn-password PASS   or $WARSHIP_TURN_PASSWORD\n"
           "  --nick NAME\n"
           "\n"
-          "TURN credentials are read from the environment when the flags are\n"
-          "omitted, so they need not appear in your shell history or in ps.\n"
+          "TURN needs a password and is skipped without one, which only costs\n"
+          "you the relay of last resort. Read it from the environment rather\n"
+          "than a flag to keep it out of your shell history and out of ps.\n"
           "libjuice speaks TURN over UDP only; turns:// on 5349 is not usable.\n",
-          argv0, argv0, DEFAULT_SIGNAL_URL, DEFAULT_TURN_PORT);
+          argv0, argv0, DEFAULT_SIGNAL_URL, DEFAULT_STUN_SERVER,
+          DEFAULT_TURN_SERVER, DEFAULT_TURN_USER, DEFAULT_TURN_PORT);
 }
 
 // Split "host:port" in place. Returns the port, or `fallback` if none given.
@@ -381,10 +395,11 @@ int main(int argc, char **argv) {
     room = argv[i++];
   }
 
-  static char stun_arg[256] = "";
+  static char stun_arg[256] = DEFAULT_STUN_SERVER;
   static char turn_arg[NET_MAX_TURN][256];
   const char *signal_url = DEFAULT_SIGNAL_URL;
   int turn_count = 0;
+  int turn_explicit = 0; // a --turn-server was given, so stop defaulting
   const char *turn_user = getenv("WARSHIP_TURN_USER");
   const char *turn_pass = getenv("WARSHIP_TURN_PASSWORD");
   const char *nick = "player";
@@ -396,7 +411,15 @@ int main(int argc, char **argv) {
       signal_url = argv[++i];
     } else if (!strcmp(a, "--stun-server") && val) {
       snprintf(stun_arg, sizeof stun_arg, "%s", argv[++i]);
+      if (!strcmp(stun_arg, "none"))
+        stun_arg[0] = '\0';
     } else if (!strcmp(a, "--turn-server") && val) {
+      turn_explicit = 1;
+      if (!strcmp(argv[i + 1], "none")) {
+        i++;
+        turn_count = 0;
+        continue;
+      }
       if (turn_count >= NET_MAX_TURN) {
         fprintf(stderr, "at most %d TURN servers\n", NET_MAX_TURN);
         return 1;
@@ -414,13 +437,23 @@ int main(int argc, char **argv) {
     }
   }
 
-  const char *stun_port_s = stun_arg[0] ? split_port(stun_arg, "3478") : NULL;
+  if (!turn_user)
+    turn_user = DEFAULT_TURN_USER;
 
-  if (turn_count && (!turn_user || !turn_pass)) {
-    fprintf(stderr, "a TURN server needs --turn-user and --turn-password "
-                    "(or WARSHIP_TURN_USER / WARSHIP_TURN_PASSWORD)\n");
+  // The default relay is only worth configuring if we can authenticate to it.
+  // Without a password we simply go without, which costs the fallback and
+  // nothing else.
+  if (!turn_explicit && turn_pass)
+    snprintf(turn_arg[turn_count++], sizeof turn_arg[0], "%s",
+             DEFAULT_TURN_SERVER);
+
+  if (turn_count && !turn_pass) {
+    fprintf(stderr, "a TURN server needs a password: --turn-password or "
+                    "WARSHIP_TURN_PASSWORD\n");
     return 1;
   }
+
+  const char *stun_port_s = stun_arg[0] ? split_port(stun_arg, "3478") : NULL;
 
   Game *g = calloc(1, sizeof *g);
   if (!g)

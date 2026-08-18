@@ -118,8 +118,13 @@ static int guest_side(const char *code) {
 }
 
 int main(int argc, char **argv) {
-  const char *port = argc > 1 ? argv[1] : "17778";
-  snprintf(url, sizeof url, "ws://127.0.0.1:%s/", port);
+  // A bare port means the local harness; a full URL lets the same test run
+  // against the real deployment.
+  const char *target = argc > 1 ? argv[1] : "17778";
+  if (!strncmp(target, "ws://", 5) || !strncmp(target, "wss://", 6))
+    snprintf(url, sizeof url, "%s", target);
+  else
+    snprintf(url, sizeof url, "ws://127.0.0.1:%s/", target);
 
   char msg[SIGNAL_MSG_MAX + 1];
   char code[SIGNAL_CODE_LEN + 1];

@@ -1,0 +1,34 @@
+# Builds the signaling image the k8s manifests reference. Nothing else in this
+# repo is containerised: the game is a terminal program.
+name: signal image
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "server/**"
+      - ".github/workflows/signal-image.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./server
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/warship-signal:latest
+            ghcr.io/${{ github.repository_owner }}/warship-signal:${{ github.sha }}

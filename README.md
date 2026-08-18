@@ -23,8 +23,8 @@ Two players, one room code. No accounts, no lobby, no launcher.
 nix develop          # or install libjuice, libplum and libwebsockets yourself
 make
 
-./warship host --signal-url wss://signal.example.com/    # prints a room code
-./warship join <code> --signal-url wss://signal.example.com/
+./warship host           # prints a room code
+./warship join <code>
 ```
 
 `wasd` to move, `r` to rotate, `space` to place and to fire, `q` to quit.
@@ -53,7 +53,7 @@ Signaling behind a reverse proxy, plus coturn. See [deploy/](deploy/) for a
 compose file, a Caddyfile, an nginx alternative and a coturn config.
 
 ```sh
-cd deploy && docker compose up -d
+kubectl apply -k deploy/k8s      # or: cd deploy && docker compose up -d
 ```
 
 The signaling service pairs peers by room code and forwards opaque payloads. It
@@ -65,4 +65,5 @@ does not parse ICE, terminate TLS, or relay anything.
 make test     # game rules and protocol, no network
 make itest    # signaling and ICE over loopback, plus the no-path failure
 make smoke    # two real processes on ptys, playing a turn
+make prod-check  # DNS, signaling, TURN and a real connection, against production
 ```

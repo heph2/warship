@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: warship
+resources:
+  - namespace.yaml
+  - signaling.yaml
+  - coturn.yaml
+  # secret.example.yaml is deliberately absent: create the real Secret out of
+  # band so a placeholder password can never be applied by accident.

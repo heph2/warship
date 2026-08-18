@@ -1,0 +1,126 @@
+# coturn: STUN, and the relay of last resort.
+#
+# hostNetwork, and pinned to tyr. Three reasons, all of them forced:
+#
+#   1. TURN hands out the address it will relay from. Behind a cluster NAT it
+#      would advertise a pod IP no one can reach.
+#   2. The relay range is thousands of UDP ports; publishing that through a
+#      Service is impractical.
+#   3. turn.pochi.casa is a single AAAA record, so the pod must always land on
+#      the same node. tyr is the k3s server and holds 2a07:7e81:85f5::babe.
+#
+# It is deliberately NOT behind Caddy: TURN is UDP and not HTTP, so there is
+# nothing for a reverse proxy to do.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coturn
+  namespace: warship
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # hostNetwork: two pods cannot hold 3478 at once
+  selector:
+    matchLabels:
+      app: coturn
+  template:
+    metadata:
+      labels:
+        app: coturn
+      annotations:
+        # Restart when the credentials change; a Secret update alone would
+        # leave the running process with the old password.
+        checksum/secret: "replace-me-or-restart-by-hand"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: tyr
+      containers:
+        - name: coturn
+          image: coturn/coturn:4.6-alpine
+          args: ["-c", "/etc/coturn/turnserver.conf"]
+          env:
+            - name: TURN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: coturn-credentials
+                  key: password
+          # The password is not in the ConfigMap: it is templated into a
+          # private copy at start-up so it never lands in `kubectl get cm`.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              sed "s|@TURN_PASSWORD@|${TURN_PASSWORD}|" \
+                /etc/coturn/turnserver.conf.tmpl > /run/turnserver.conf
+              exec turnserver -c /run/turnserver.conf
+          volumeMounts:
+            - name: config
+              mountPath: /etc/coturn
+              readOnly: true
+            - name: run
+              mountPath: /run
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: coturn-config
+        - name: run
+          emptyDir:
+            medium: Memory
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coturn-config
+  namespace: warship
+data:
+  turnserver.conf.tmpl: |
+    # IPv6 only: *.pochi.casa publishes AAAA records and nothing else, so
+    # there is no v4 address worth listening on or relaying from.
+    listening-ip=2a07:7e81:85f5::babe
+    relay-ip=2a07:7e81:85f5::babe
+    external-ip=2a07:7e81:85f5::babe
+
+    listening-port=3478
+    fingerprint
+    lt-cred-mech
+    realm=turn.pochi.casa
+    user=warship:@TURN_PASSWORD@
+
+    # Relay ports. These must be open in tyr's firewall or TURN completes its
+    # handshake and then relays nothing, which looks like an ICE failure
+    # rather than a firewall problem. Keep the range small; one port per game.
+    min-port=49160
+    max-port=49200
+
+    # libjuice does TURN over UDP only (juice_turn_server_t has no transport
+    # field), so a TLS listener on 5349 would be reassuring and useless.
+
+    no-multicast-peers
+    no-cli
+    no-tlsv1
+    no-tlsv1_1
+
+    # The relay must reach the other player and nothing else. Without these a
+    # public TURN server is a proxy into the home network.
+    denied-peer-ip=::1
+    denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+    denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+    denied-peer-ip=0.0.0.0-0.255.255.255
+    denied-peer-ip=10.0.0.0-10.255.255.255
+    denied-peer-ip=127.0.0.0-127.255.255.255
+    denied-peer-ip=169.254.0.0-169.254.255.255
+    denied-peer-ip=172.16.0.0-172.31.255.255
+    denied-peer-ip=192.168.0.0-192.168.255.255

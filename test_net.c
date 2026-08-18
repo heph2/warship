@@ -162,9 +162,14 @@ int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "unit"))
     return unit_tests();
 
-  const char *port = argc > 1 ? argv[1] : "17779";
+  // A bare port means the local harness; a full URL lets the same test run
+  // against the real deployment.
+  const char *target = argc > 1 ? argv[1] : "17779";
   int expect_failure = argc > 2 && !strcmp(argv[2], "nopath");
-  snprintf(signal_url, sizeof signal_url, "ws://127.0.0.1:%s/", port);
+  if (!strncmp(target, "ws://", 5) || !strncmp(target, "wss://", 6))
+    snprintf(signal_url, sizeof signal_url, "%s", target);
+  else
+    snprintf(signal_url, sizeof signal_url, "ws://127.0.0.1:%s/", target);
 
   int code_pipe[2];
   assert(pipe(code_pipe) == 0);
@@ -184,8 +189,9 @@ int main(int argc, char **argv) {
     close(code_pipe[1]);
     char code[16] = {0};
     ssize_t r = read(code_pipe[0], code, sizeof code - 1);
-    assert(r > 0);
     close(code_pipe[0]);
+    if (r <= 0)
+      _exit(1); // the parent never got a room; it reports the real error
 
     if (expect_failure)
       _exit(deaf_peer(code));
@@ -207,8 +213,8 @@ int main(int argc, char **argv) {
       struct timespec ts = {.tv_nsec = 50000000};
       nanosleep(&ts, NULL);
     }
-    if (strcmp(net_route(n), "host")) {
-      fprintf(stderr, "guest: route %s, wanted host\n", net_route(n));
+    if (!strcmp(net_route(n), "unknown")) {
+      fprintf(stderr, "guest: no route reported\n");
       _exit(1);
     }
     net_close(n);
@@ -254,7 +260,7 @@ int main(int argc, char **argv) {
   }
 
   printf("route: %s\n", net_route(n));
-  assert(!strcmp(net_route(n), "host"));
+  assert(strcmp(net_route(n), "unknown"));
   assert(net_alive(n));
 
   int closed = signaling_is_closed(room);

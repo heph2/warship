@@ -29,6 +29,10 @@ itest: signal-server test_signaling test_net
 	  kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; \
 	  sleep 0.3; exit $$rc   # let 17778 be released before the next run
 
+# Regression test against the real pochi.casa deployment.
+prod-check: test_signaling test_net
+	@./tools/infra-check.sh
+
 # Drives two real processes on ptys through a full turn. Needs python3.
 smoke: $(TARGET) signal-server
 	@python3 tools/smoke.py
@@ -55,4 +59,4 @@ test_proto: board.o proto.o test_proto.o
 clean:
 	rm -f $(TARGET) $(TESTS) test_signaling test_net signal-server *.o
 
-.PHONY: clean test itest smoke
+.PHONY: clean test itest smoke prod-check

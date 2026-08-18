@@ -1,8 +1,12 @@
 # Deploying warship
 
-Two services on one host: a signaling endpoint behind a reverse proxy, and
-coturn. Nothing custom is exposed to the internet except the signaling
-websocket, and that carries no game traffic.
+Two services: a signaling endpoint behind a reverse proxy, and coturn. Nothing
+custom is exposed to the internet except the signaling websocket, and that
+carries no game traffic.
+
+`k8s/` is the pochi.casa deployment; `docker-compose.yml` and the Caddyfile
+next to it are the generic single-host equivalent. Both describe the same
+architecture.
 
 ```
                  443/tcp  HTTPS + WSS
@@ -79,3 +83,54 @@ becoming a permanent free relay. The cost is that the signaling service must
 then hold that secret and hand out credentials, which is a responsibility it
 deliberately does not have today. Worth doing before opening this to strangers,
 not before.
+
+
+## The pochi.casa deployment
+
+```
+                                signal.pochi.casa (AAAA -> sauron ::beef)
+Player ── wss 443 ──► Caddy on sauron ── NodePort 30777 ──► warship-signal pod
+
+                                turn.pochi.casa (AAAA -> tyr ::babe)
+Player ── udp 3478 ─────────────────────────────────────►  coturn (hostNetwork)
+Player ── udp 49160-49200 ──────────────────────────────►  relay allocations
+```
+
+Signaling follows the route `cuppy.pochi.casa` already uses: a NodePort on both
+k3s nodes with Caddy on sauron in front. coturn cannot: TURN is UDP and not
+HTTP, so there is nothing for a reverse proxy to do, and the relay hands out
+the address it will relay from. It therefore runs with `hostNetwork` pinned to
+tyr, and `turn.pochi.casa` points straight at tyr's public address.
+
+### Apply
+
+```sh
+kubectl -n warship create secret generic coturn-credentials \
+  --from-literal=password="$(openssl rand -base64 24)"
+
+kubectl apply -k deploy/k8s
+```
+
+### DNS
+
+Neither record exists yet. Both are AAAA only, matching the rest of the zone.
+
+| Name | Type | Value | Why |
+|---|---|---|---|
+| `signal.pochi.casa` | AAAA | `2a07:7e81:85f5::beef` | sauron, which runs the Caddy that fronts the cluster |
+| `turn.pochi.casa` | AAAA | `2a07:7e81:85f5::babe` | tyr, the only node coturn is pinned to |
+
+### Changes needed in the infra repo
+
+- `hosts/sauron/caddy.nix` — the `signal.pochi.casa` vhost.
+- `hosts/tyr/default.nix` — 3478/udp, 3478/tcp and 49160-49200/udp.
+
+### Checking it
+
+```sh
+export WARSHIP_TURN_PASSWORD=...
+make prod-check
+```
+
+DNS, the websocket round trip, a real TURN allocation, and two clients pairing
+through production. Run it after any change to either repo.
