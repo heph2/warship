@@ -15,6 +15,15 @@ make test     # board rules, protocol, candidate parsing -- no network
 make itest    # signaling and ICE over loopback; starts its own server
 make smoke    # two real processes on ptys through a full turn; needs python3
 make signal-server
+make prod-check   # against the live deployment; see below
+```
+
+The flake also builds both binaries, so `nix run github:heph2/warship` works
+without a checkout:
+
+```sh
+nix build .#warship        # also .#default
+nix build .#signal-server
 ```
 
 `make test` must stay network-free and must stay fast. Anything needing a
@@ -96,6 +105,9 @@ checking the room no longer exists.
   is not immediately readable. Re-read it rather than latching the first
   answer, and sleep between attempts -- spinning on it starves the libjuice
   thread that has to publish the pair.
+- `turnutils_uclient` has no `-6`: IPv6 relay is `-x`, and it needs `-y` (or a
+  peer address) or it prints usage and exits non-zero, which reads exactly
+  like a dead relay. It takes an address, not a hostname.
 - The coturn image's turnserver carries a file capability, so `capabilities:
   drop: ["ALL"]` alone makes execve fail with EPERM and the pod crash-loops
   with "Operation not permitted". It needs NET_BIND_SERVICE back in the
@@ -106,6 +118,27 @@ checking the room no longer exists.
   are coming.
 - `snprintf` into a buffer that is also the source is an overlapping copy. It
   produced an empty room code once.
+
+## Deployment
+
+The client defaults to the pochi.casa services and needs no arguments.
+`deploy/k8s` is that deployment; `deploy/docker-compose.yml` is the generic
+single-host equivalent. Both are described in `deploy/README.md`.
+
+Signaling runs in k3s as a NodePort behind Caddy on sauron, following the route
+`cuppy.pochi.casa` already takes. coturn cannot follow it -- TURN is UDP, and
+the relay hands out the address it will relay from -- so it runs with
+`hostNetwork` pinned to tyr, and `turn.pochi.casa` points straight there. Both
+names are AAAA only.
+
+`make prod-check` is the regression test for all of it: DNS, the websocket
+round trip through Caddy, a real TURN allocation, and two clients connecting.
+Run it after touching either repo. It needs `WARSHIP_TURN_PASSWORD` (read it
+out of the cluster Secret) and `turnutils_uclient` from nixpkgs#coturn.
+
+Two things that changed on the infra side and live in `~/code/infra`:
+`hosts/sauron/caddy.nix` has the `signal.pochi.casa` vhost, and
+`hosts/tyr/default.nix` opens 3478 plus the 49160-49200 relay range.
 
 ## Style
 

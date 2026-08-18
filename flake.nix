@@ -57,8 +57,74 @@
             platforms = pkgs.lib.platforms.unix;
           };
         });
+        warship = pkgs.stdenv.mkDerivation {
+          pname = "warship";
+          version = "0.1.0";
+          src = ./.;
+
+          buildInputs = with pkgs; [
+            libjuice
+            libplum
+            libwebsockets
+            openssl
+          ];
+
+          # The Makefile has no install target: this is a two-binary project
+          # and a rule to copy one file is not worth carrying.
+          installPhase = ''
+            runHook preInstall
+            install -Dm755 warship $out/bin/warship
+            runHook postInstall
+          '';
+
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            make test
+            runHook postCheck
+          '';
+
+          meta = {
+            description = "Terminal Battleship played peer to peer over ICE";
+            homepage = "https://github.com/heph2/warship";
+            mainProgram = "warship";
+            platforms = pkgs.lib.platforms.linux;
+          };
+        };
+
+        signal-server = pkgs.stdenv.mkDerivation {
+          pname = "warship-signal-server";
+          version = "0.1.0";
+          src = ./.;
+
+          buildInputs = [
+            pkgs.libwebsockets
+            pkgs.openssl
+          ];
+
+          buildPhase = ''
+            runHook preBuild
+            make signal-server
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            install -Dm755 signal-server $out/bin/warship-signal-server
+            runHook postInstall
+          '';
+
+          meta = {
+            description = "Room-code signaling service for warship";
+            mainProgram = "warship-signal-server";
+            platforms = pkgs.lib.platforms.linux;
+          };
+        };
       in
       {
+        packages.default = warship;
+        packages.warship = warship;
+        packages.signal-server = signal-server;
         packages.libjuice = libjuice;
         packages.libplum = libplum;
 
