@@ -17,4 +17,4 @@ test_board
 test_proto
 test_signaling
 test_net
-rendezvous
+signal-server

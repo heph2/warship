@@ -82,13 +82,23 @@
           # Libraries we link against. These belong in buildInputs, not
           # packages: only buildInputs makes the cc wrapper add the -I and -L
           # paths, and libjuice ships no pkg-config file to fall back on.
-          buildInputs = [ libjuice libplum ];
+          # libwebsockets is built against OpenSSL and its public header includes
+          # <openssl/ssl.h>, so OpenSSL has to be here too even though we never
+          # call it directly. LWS gives us wss:// on the client; the signaling
+          # server itself stays plaintext behind a reverse proxy.
+          buildInputs = with pkgs; [
+            libjuice
+            libplum
+            libwebsockets
+            openssl
+          ];
 
           shellHook = ''
             echo "warship C/C++ dev shell"
             echo "  cc: $(gcc --version | head -n1)"
             echo "  make: $(make --version | head -n1)"
             echo "  libjuice: ${libjuice.version}  libplum: ${libplum.version}"
+            echo "  libwebsockets: ${pkgs.libwebsockets.version}"
           '';
         };
       }

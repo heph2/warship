@@ -12,9 +12,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#define DEFAULT_SIGNAL_PORT "7777"
-#define DEFAULT_STUN_HOST "stun.l.google.com"
-#define DEFAULT_STUN_PORT 19302
+#define DEFAULT_SIGNAL_URL "ws://127.0.0.1:7777"
+#define DEFAULT_TURN_PORT 3478
 
 typedef enum {
   ST_WAIT_READY, // both sides placed; waiting for the peer to say so
@@ -272,13 +271,11 @@ static void battle_loop(Game *g) {
     draw(g);
 
     int timeout = proto_timeout_ms(&g->proto, now);
-    struct pollfd fds[1 + NET_MAX_POLLFDS];
-    fds[0] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
-    // More than one transport descriptor: the ICE pipe and the signaling
-    // socket, which doubles as the relay.
-    int nfds = 1 + net_pollfds(g->net, fds + 1, NET_MAX_POLLFDS);
-
-    if (poll(fds, (nfds_t)nfds, timeout) < 0) {
+    struct pollfd fds[2] = {
+        {.fd = STDIN_FILENO, .events = POLLIN},
+        {.fd = net_fd(g->net), .events = POLLIN},
+    };
+    if (poll(fds, 2, timeout) < 0) {
       if (errno == EINTR)
         continue;
       return;
@@ -291,12 +288,7 @@ static void battle_loop(Game *g) {
       on_key(g, key);
     }
 
-    int net_ready = 0;
-    for (int i = 1; i < nfds; i++)
-      if (fds[i].revents & (POLLIN | POLLHUP | POLLERR))
-        net_ready = 1;
-
-    if (net_ready) {
+    if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
       char buf[NET_MAX_DATAGRAM];
       int len;
       while ((len = net_recv(g->net, buf, sizeof buf)) > 0) {
@@ -344,13 +336,18 @@ static void usage(const char *argv0) {
           "  %s join <code> [options]\n"
           "\n"
           "options:\n"
-          "  --signal HOST[:PORT]   rendezvous server (default port %s)\n"
-          "  --stun HOST[:PORT]     STUN server (default %s:%d)\n"
-          "  --turn HOST[:PORT]     TURN relay, needed behind symmetric NAT\n"
-          "  --turn-user USER\n"
-          "  --turn-pass PASS\n"
-          "  --nick NAME\n",
-          argv0, argv0, DEFAULT_SIGNAL_PORT, DEFAULT_STUN_HOST, DEFAULT_STUN_PORT);
+          "  --signal-url URL       ws:// or wss:// signaling service\n"
+          "                         (default %s)\n"
+          "  --stun-server H[:P]    STUN server, default port 3478\n"
+          "  --turn-server H[:P]    TURN relay, repeatable, default port %d\n"
+          "  --turn-user USER       or $WARSHIP_TURN_USER\n"
+          "  --turn-password PASS   or $WARSHIP_TURN_PASSWORD\n"
+          "  --nick NAME\n"
+          "\n"
+          "TURN credentials are read from the environment when the flags are\n"
+          "omitted, so they need not appear in your shell history or in ps.\n"
+          "libjuice speaks TURN over UDP only; turns:// on 5349 is not usable.\n",
+          argv0, argv0, DEFAULT_SIGNAL_URL, DEFAULT_TURN_PORT);
 }
 
 // Split "host:port" in place. Returns the port, or `fallback` if none given.
@@ -384,31 +381,46 @@ int main(int argc, char **argv) {
     room = argv[i++];
   }
 
-  char signal_arg[256] = "127.0.0.1";
-  char stun_arg[256] = DEFAULT_STUN_HOST;
-  char turn_arg[256] = "";
-  const char *stun_port_s = NULL, *turn_port_s = "3478";
-  const char *turn_user = NULL, *turn_pass = NULL;
+  static char stun_arg[256] = "";
+  static char turn_arg[NET_MAX_TURN][256];
+  const char *signal_url = DEFAULT_SIGNAL_URL;
+  int turn_count = 0;
+  const char *turn_user = getenv("WARSHIP_TURN_USER");
+  const char *turn_pass = getenv("WARSHIP_TURN_PASSWORD");
   const char *nick = "player";
 
   for (; i < argc; i++) {
     const char *a = argv[i];
     const char *val = (i + 1 < argc) ? argv[i + 1] : NULL;
-    if (!strcmp(a, "--signal") && val) snprintf(signal_arg, sizeof signal_arg, "%s", argv[++i]);
-    else if (!strcmp(a, "--stun") && val) snprintf(stun_arg, sizeof stun_arg, "%s", argv[++i]);
-    else if (!strcmp(a, "--turn") && val) snprintf(turn_arg, sizeof turn_arg, "%s", argv[++i]);
-    else if (!strcmp(a, "--turn-user") && val) turn_user = argv[++i];
-    else if (!strcmp(a, "--turn-pass") && val) turn_pass = argv[++i];
-    else if (!strcmp(a, "--nick") && val) nick = argv[++i];
-    else {
+    if (!strcmp(a, "--signal-url") && val) {
+      signal_url = argv[++i];
+    } else if (!strcmp(a, "--stun-server") && val) {
+      snprintf(stun_arg, sizeof stun_arg, "%s", argv[++i]);
+    } else if (!strcmp(a, "--turn-server") && val) {
+      if (turn_count >= NET_MAX_TURN) {
+        fprintf(stderr, "at most %d TURN servers\n", NET_MAX_TURN);
+        return 1;
+      }
+      snprintf(turn_arg[turn_count++], sizeof turn_arg[0], "%s", argv[++i]);
+    } else if (!strcmp(a, "--turn-user") && val) {
+      turn_user = argv[++i];
+    } else if (!strcmp(a, "--turn-password") && val) {
+      turn_pass = argv[++i];
+    } else if (!strcmp(a, "--nick") && val) {
+      nick = argv[++i];
+    } else {
       usage(argv[0]);
       return 1;
     }
   }
 
-  const char *signal_port = split_port(signal_arg, DEFAULT_SIGNAL_PORT);
-  stun_port_s = split_port(stun_arg, NULL);
-  turn_port_s = turn_arg[0] ? split_port(turn_arg, "3478") : NULL;
+  const char *stun_port_s = stun_arg[0] ? split_port(stun_arg, "3478") : NULL;
+
+  if (turn_count && (!turn_user || !turn_pass)) {
+    fprintf(stderr, "a TURN server needs --turn-user and --turn-password "
+                    "(or WARSHIP_TURN_USER / WARSHIP_TURN_PASSWORD)\n");
+    return 1;
+  }
 
   Game *g = calloc(1, sizeof *g);
   if (!g)
@@ -426,19 +438,25 @@ int main(int argc, char **argv) {
   ui_message("connecting...", NULL);
 
   NetConfig cfg = {
-      .signal_host = signal_arg,
-      .signal_port = signal_port,
+      .signal_url = signal_url,
       .room = room,
-      .stun_host = stun_arg,
-      .stun_port = stun_port_s ? atoi(stun_port_s) : DEFAULT_STUN_PORT,
-      .turn_host = turn_arg[0] ? turn_arg : NULL,
-      .turn_port = turn_port_s ? atoi(turn_port_s) : 0,
-      .turn_user = turn_user,
-      .turn_pass = turn_pass,
-      .timeout_ms = 300000,   // five minutes for a human to type the code
-      .ice_timeout_ms = 20000, // then relay rather than give up
+      .stun_host = stun_arg[0] ? stun_arg : NULL,
+      .stun_port = stun_port_s ? atoi(stun_port_s) : 0,
+      .timeout_ms = 300000,    // five minutes for a human to type the code
+      .ice_timeout_ms = 30000, // then give up cleanly; there is no fallback
       .on_room = show_room,
   };
+
+  // Credentials go into the config and are never printed. Nothing in this
+  // program logs cfg, and net.c only ever hands them to libjuice.
+  for (int t = 0; t < turn_count; t++) {
+    const char *tp = split_port(turn_arg[t], "3478");
+    cfg.turn[t].host = turn_arg[t];
+    cfg.turn[t].port = tp ? atoi(tp) : DEFAULT_TURN_PORT;
+    cfg.turn[t].user = turn_user;
+    cfg.turn[t].pass = turn_pass;
+  }
+  cfg.turn_count = turn_count;
 
   int is_host = 0;
   if (!net_open(&g->net, &cfg, room_code, sizeof room_code, &is_host)) {

@@ -10,30 +10,31 @@ OBJ = $(GAME_OBJ) ui.o $(NET_OBJ) main.o
 
 # libjuice ships CMake config but no .pc file, so there is nothing for
 # pkg-config to find; the nix dev shell puts its -I/-L on the cc wrapper.
-LDLIBS = -ljuice -lplum
+LDLIBS = -ljuice -lplum -lwebsockets
 
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
 test_signaling: signaling.o test_signaling.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_net: $(NET_OBJ) test_net.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # Needs a live server, so it stays out of `make test`.
-itest: rendezvous test_signaling test_net
-	@./rendezvous 17778 & pid=$$!; sleep 0.3; \
-	  ./test_signaling 17778 && ./test_net 17778 && ./test_net 17778 relay; \
+itest: signal-server test_signaling test_net
+	@./signal-server 17778 >/dev/null 2>&1 & pid=$$!; sleep 0.6; \
+	  ./test_signaling 17778 && ./test_net 17778 && ./test_net 17778 nopath; \
 	  rc=$$?; \
-	  kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; exit $$rc
+	  kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; \
+	  sleep 0.3; exit $$rc   # let 17778 be released before the next run
 
 # Drives two real processes on ptys through a full turn. Needs python3.
-smoke: $(TARGET) rendezvous
+smoke: $(TARGET) signal-server
 	@python3 tools/smoke.py
 
-rendezvous: server/rendezvous.c
-	$(CC) $(CFLAGS) -o $@ $<
+signal-server: server/signaling_server.c
+	$(CC) $(CFLAGS) -o $@ $< -lwebsockets
 
 TESTS = test_board test_proto
 
@@ -52,6 +53,6 @@ test_proto: board.o proto.o test_proto.o
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(TESTS) test_signaling test_net rendezvous *.o
+	rm -f $(TARGET) $(TESTS) test_signaling test_net signal-server *.o
 
 .PHONY: clean test itest smoke

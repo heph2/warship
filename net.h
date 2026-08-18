@@ -1,40 +1,47 @@
 #ifndef NET_H
 #define NET_H
 
-// ICE transport. Wraps libjuice and the rendezvous handshake so the rest of the
+// ICE transport. Wraps libjuice and the signaling handshake so the rest of the
 // program sees one pollable fd and two functions.
 //
-// libjuice invokes its callbacks from its own thread. Nothing in this module
-// lets that thread touch game state or the signaling socket: every callback does
-// exactly one thing, write a tagged record into a socketpair. The main loop owns
+// libjuice and libplum invoke their callbacks from their own threads. Nothing
+// here lets those threads touch game state: every callback does exactly one
+// thing, write a tagged record into a socketpair. The main loop owns
 // everything else, so there is not a single mutex in the program.
 //
-// What comes out is still UNRELIABLE datagrams -- ICE is not DTLS and not SCTP.
-// Loss, duplication and reordering are proto.c's problem, by design.
-
-#include <poll.h>
+// Game traffic only ever travels over ICE: a direct path, a port the router
+// opened for us, or a coturn relay candidate. The signaling websocket is
+// closed the moment ICE connects and never carries a game packet.
+//
+// What comes out is still UNRELIABLE datagrams -- ICE is not DTLS and not
+// SCTP. Loss, duplication and reordering are proto.c's problem, by design.
 
 #define NET_MAX_DATAGRAM 1200 // comfortably under any real path MTU
-#define NET_MAX_POLLFDS 2
+#define NET_MAX_TURN 4
 
 typedef struct Net Net;
 
 typedef struct {
-  const char *signal_host;
-  const char *signal_port;
-  const char *room; // NULL: create a room and report the code back
-  const char *stun_host;
+  const char *host;
+  int port;
+  const char *user;
+  const char *pass;
+} NetTurn;
+
+typedef struct {
+  const char *signal_url; // ws://host[:port][/path] or wss://...
+  const char *room;       // NULL: create a room and report the code back
+
+  const char *stun_host; // NULL disables STUN entirely
   int stun_port;
-  const char *turn_host; // NULL: no relay fallback (symmetric NAT will fail)
-  int turn_port;
-  const char *turn_user;
-  const char *turn_pass;
+
+  // libjuice takes TURN over UDP only: its juice_turn_server_t has no
+  // transport field. turns: on 5349 cannot be configured, so do not offer it.
+  NetTurn turn[NET_MAX_TURN];
+  int turn_count;
+
   int timeout_ms;     // how long to wait for a human to type the code
-  // How long to attempt a direct path before falling back to the relay.
-  // Negative skips ICE entirely and relays from the start, which is the only
-  // deterministic way to exercise the relay: on loopback a direct connection
-  // can complete in about a millisecond, so no timeout is reliably shorter.
-  int ice_timeout_ms;
+  int ice_timeout_ms; // how long to attempt connectivity before giving up
 
   // Called as soon as the room code is known, which is BEFORE the wait for the
   // other player. Without this the host could never show the code it is asking
@@ -43,27 +50,21 @@ typedef struct {
   void *on_room_ctx;
 } NetConfig;
 
-// Runs the whole handshake and blocks until ICE connects. On success *is_host
-// says who fires first, and room_out holds the code (useful when cfg->room was
-// NULL and the server invented one).
+// Runs the whole handshake and blocks until ICE connects. Failure to find any
+// path -- direct, mapped or relayed -- is a clean error, not a fallback.
 int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
              int *is_host);
 
-// Fill in the descriptors the caller must poll. Returns how many were written.
-// There is more than one: the ICE datagram pipe, and the signaling socket,
-// which now stays open for the whole game so it can relay if ICE cannot find a
-// direct path.
-int net_pollfds(const Net *n, struct pollfd *out, int cap);
+int net_fd(const Net *n); // poll() this for readability
 int net_send(Net *n, const char *buf, int len);
 
 // One datagram, or 0 when nothing is pending. Never blocks.
 int net_recv(Net *n, char *buf, int cap);
 
-int net_alive(const Net *n); // 0 once neither ICE nor the relay can carry data
+int net_alive(const Net *n);
 
-// "host", "port-mapped" (the router opened a port for us), "srflx", "relay"
-// (TURN) or "signal-relay" (through the rendezvous server, the fallback that
-// needs no TURN deployment at all).
+// "host", "port-mapped" (the router opened a port for us), "srflx" or "relay"
+// (a coturn allocation).
 const char *net_route(const Net *n);
 void net_close(Net *n);
 const char *net_error(void);

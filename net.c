@@ -25,17 +25,15 @@
 #define TAG_MAP 'M'   // the router gave us an external ip:port
 
 #define MAX_PENDING 4 // early datagrams held during the handshake
-#define PROTO_LINE_CAP 512 // one relayed message; proto.c caps its lines at 256
 
-// How data actually reaches the peer.
-typedef enum {
-  MODE_ICE,  // direct, or via TURN if one was configured
-  MODE_RELAY // through the rendezvous server we already have a socket to
-} Mode;
+// Payload tags inside a SIGNAL message. The signaling service never looks at
+// these -- to it the payload is opaque, which is exactly the point.
+#define SIG_DESC 'D'
+#define SIG_CAND 'C'
+#define SIG_DONE 'G'
 
 struct Net {
   juice_agent_t *agent;
-  Mode mode;
 
   // Port mapping. libjuice speaks STUN but never asks the router directly, so
   // a NAT that would happily open a port never gets asked. libplum asks, over
@@ -48,7 +46,14 @@ struct Net {
   int host_port;
   int pipe[2]; // [0] read by main loop, [1] written by the juice thread
   atomic_int state;
-  Signal sig;
+  Signal *sig; // closed as soon as ICE connects; never carries game traffic
+
+  // Signaling ending is not a connection failure. Whoever completes ICE first
+  // closes its websocket, which collapses the room and hands the other peer a
+  // PEERGONE while it is still finishing. All it really means is that no
+  // further candidates will arrive.
+  int signaling_done;
+  char signaling_reason[128];
 
   // Datagrams that arrived before net_open() returned. Bounded on purpose:
   // dropping past the cap is safe because proto.c retransmits.
@@ -56,6 +61,9 @@ struct Net {
   int pendlen[MAX_PENDING];
   int npend;
 };
+
+// Defined below, next to offer(): used by the pipe handlers above it.
+static int send_signal(Net *n, char tag, const char *body);
 
 static char last_err[256] = "";
 
@@ -169,64 +177,11 @@ int net_mapped_candidate(const char *host_cand, const char *ext_ip, int ext_port
   return n2 > 0 && n2 < cap;
 }
 
-// ------------------------------------------------------------- SDP on one line ---
-
-// A local description is multi-line; the signaling protocol is line-based.
-// Swap newlines for '|' rather than inventing a multi-line framing.
-static int sdp_pack(const char *sdp, char *out, int cap) {
-  int j = 0;
-  for (int i = 0; sdp[i]; i++) {
-    if (sdp[i] == '\r')
-      continue;
-    if (j >= cap - 1)
-      return 0;
-    out[j++] = (sdp[i] == '\n') ? '|' : sdp[i];
-  }
-  while (j > 0 && out[j - 1] == '|')
-    j--; // trailing newline would become a blank SDP line
-  out[j] = '\0';
-  return j > 0;
-}
-
-static int sdp_unpack(const char *packed, char *out, int cap) {
-  int j = 0;
-  for (int i = 0; packed[i]; i++) {
-    if (j >= cap - 2)
-      return 0;
-    out[j++] = (packed[i] == '|') ? '\n' : packed[i];
-  }
-  out[j++] = '\n';
-  out[j] = '\0';
-  return 1;
-}
-
 // ------------------------------------------------------------------- open ---
 
-int net_pollfds(const Net *n, struct pollfd *out, int cap) {
-  int i = 0;
-  if (i < cap && n->pipe[0] >= 0)
-    out[i++] = (struct pollfd){.fd = n->pipe[0], .events = POLLIN};
-  if (i < cap && signal_fd(&n->sig) >= 0)
-    out[i++] = (struct pollfd){.fd = signal_fd(&n->sig), .events = POLLIN};
-  return i;
-}
-
-// Give up on a direct path. Not an error: the game carries on over the relay.
-//
-// Announce it with an empty RELAY line rather than waiting for the first game
-// message. Otherwise a peer whose own ICE succeeded keeps sending into a
-// session we stopped listening to, and only discovers the truth when its
-// retransmits run out.
-static void go_relay(Net *n) {
-  if (n->mode == MODE_RELAY)
-    return;
-  n->mode = MODE_RELAY;
-  signal_send(&n->sig, "RELAY", ""); // payload-free: a mode switch, not data
-}
+int net_fd(const Net *n) { return n->pipe[0]; }
 
 int net_alive(const Net *n) {
-  if (n->mode == MODE_RELAY)
-    return signal_fd(&n->sig) >= 0;
   int st = atomic_load((atomic_int *)&n->state);
   return st != JUICE_STATE_FAILED && st != JUICE_STATE_DISCONNECTED;
 }
@@ -234,8 +189,6 @@ int net_alive(const Net *n) {
 const char *net_route(const Net *n) {
   static char local[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
   static char remote[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
-  if (n->mode == MODE_RELAY)
-    return "signal-relay";
   if (juice_get_selected_candidates(n->agent, local, sizeof local, remote,
                                     sizeof remote) != 0)
     return "unknown";
@@ -258,47 +211,41 @@ static void stash(Net *n, const char *buf, int len) {
   n->npend++;
 }
 
-// Handle one line from the signaling server. 0 means give up. *got_desc is set
-// when the peer's description was applied.
-static int on_signal_line(Net *n, const char *line, int *got_desc) {
-  char sdp[JUICE_MAX_SDP_STRING_LEN];
-
-  // A RELAY line proves the peer gave up on a direct path. Follow it, or we
-  // would keep shouting into an ICE session it has stopped listening to.
-  if (!strncmp(line, "RELAY ", 6)) {
-    go_relay(n);
-    return 1;
+// Handle one signaling message. 0 means give up. *got_desc is set when the
+// peer's description was applied.
+static int on_signal_msg(Net *n, const char *msg, int *got_desc) {
+  if (!strcmp(msg, "PEERGONE") || !strncmp(msg, "ERROR", 5)) {
+    n->signaling_done = 1;
+    snprintf(n->signaling_reason, sizeof n->signaling_reason, "%.*s",
+             (int)sizeof n->signaling_reason - 1,
+             msg[0] == 'P' ? "the other player left the signaling service"
+                           : msg);
+    return 1; // carry on: ICE may well finish with the candidates we have
   }
+  if (strncmp(msg, "SIGNAL ", 7))
+    return 1; // unknown but harmless
 
-  if (!strncmp(line, "DESC ", 5)) {
-    if (!sdp_unpack(line + 5, sdp, sizeof sdp)) {
-      set_err("peer description too long");
-      return 0;
-    }
-    if (juice_set_remote_description(n->agent, sdp) != 0) {
-      set_err("peer sent an unusable ICE description");
+  const char *payload = msg + 7;
+  char tag = payload[0];
+  const char *body = payload + 1;
+
+  switch (tag) {
+  case SIG_DESC:
+    if (juice_set_remote_description(n->agent, body) != 0) {
+      set_err("the other player sent an unusable ICE description");
       return 0;
     }
     *got_desc = 1;
     return 1;
-  }
-  if (!strncmp(line, "CAND ", 5)) {
-    juice_add_remote_candidate(n->agent, line + 5); // a bad one is just ignored
+  case SIG_CAND:
+    juice_add_remote_candidate(n->agent, body); // a bad one is just ignored
     return 1;
-  }
-  if (!strcmp(line, "DONE")) {
+  case SIG_DONE:
     juice_set_remote_gathering_done(n->agent);
     return 1;
+  default:
+    return 1;
   }
-  if (!strcmp(line, "PEERGONE")) {
-    set_err("peer disconnected during setup");
-    return 0;
-  }
-  if (!strncmp(line, "ERR", 3)) {
-    set_err(line);
-    return 0;
-  }
-  return 1; // unknown but harmless
 }
 
 // Handle one record off the socketpair. 0 means give up.
@@ -314,7 +261,7 @@ static int on_pipe_record(Net *n, const char *rec, int len, int connecting) {
       return 1;
     memcpy(cand, body, (size_t)blen);
     cand[blen] = '\0';
-    signal_send(&n->sig, "CAND", cand);
+    send_signal(n, SIG_CAND, cand);
 
     // libjuice tells us the port it bound by publishing a host candidate, so
     // there is no need to pin one in advance -- which also means two clients
@@ -347,37 +294,49 @@ static int on_pipe_record(Net *n, const char *rec, int len, int connecting) {
 
     char cand[JUICE_MAX_CANDIDATE_SDP_STRING_LEN + 1];
     if (net_mapped_candidate(n->host_cand, ext_ip, ext_port, cand, (int)sizeof cand))
-      signal_send(&n->sig, "CAND", cand); // one more path for the peer to try
+      send_signal(n, SIG_CAND, cand); // one more path for the peer to try
     return 1;
   }
   case TAG_DONE:
-    signal_send(&n->sig, "DONE", NULL);
+    send_signal(n, SIG_DONE, "");
     return 1;
   case TAG_DATA:
     if (connecting)
       stash(n, body, blen); // peer got there first; do not lose the message
     return 1;
-  case TAG_STATE: {
-    int st = atomic_load(&n->state);
-    if (st == JUICE_STATE_FAILED)
-      go_relay(n); // no direct path exists; the relay still does
+  case TAG_STATE:
+    // Failure is reported, never worked around. If neither a direct path nor a
+    // coturn allocation exists there is nowhere left to go.
+    if (atomic_load(&n->state) == JUICE_STATE_FAILED) {
+      set_err("ICE failed: no direct path and no working TURN relay");
+      return 0;
+    }
     return 1;
-  }
   default:
     return 1;
   }
 }
 
+// Wrap one ICE payload in a SIGNAL message. The tag is ours; the service that
+// forwards it neither reads nor understands it.
+static int send_signal(Net *n, char tag, const char *body) {
+  char msg[SIGNAL_MSG_MAX + 1];
+  int len = snprintf(msg, sizeof msg, "SIGNAL %c%s", tag, body);
+  if (len <= 0 || len >= (int)sizeof msg) {
+    set_err("signaling payload too long");
+    return 0;
+  }
+  return signal_send(n->sig, msg);
+}
+
 // Publish our ICE description and start gathering candidates.
 static int offer(Net *n) {
   char local[JUICE_MAX_SDP_STRING_LEN];
-  char packed[JUICE_MAX_SDP_STRING_LEN];
-  if (juice_get_local_description(n->agent, local, sizeof local) != 0 ||
-      !sdp_pack(local, packed, sizeof packed)) {
+  if (juice_get_local_description(n->agent, local, sizeof local) != 0) {
     set_err("could not build a local ICE description");
     return 0;
   }
-  if (!signal_send(&n->sig, "DESC", packed)) {
+  if (!send_signal(n, SIG_DESC, local)) {
     set_err(signal_error());
     return 0;
   }
@@ -397,19 +356,19 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
 
   int timeout = cfg->timeout_ms > 0 ? cfg->timeout_ms : 30000;
 
-  if (!signal_connect(&n->sig, cfg->signal_host, cfg->signal_port)) {
+  if (!signal_connect(&n->sig, cfg->signal_url, timeout)) {
     set_err(signal_error());
     goto fail;
   }
 
   if (cfg->room) {
-    if (!signal_join_room(&n->sig, cfg->room, timeout)) {
+    if (!signal_join_room(n->sig, cfg->room)) {
       set_err(signal_error());
       goto fail;
     }
     snprintf(room_out, (size_t)room_cap, "%s", cfg->room);
   } else {
-    if (!signal_new_room(&n->sig, room_out, room_cap, timeout)) {
+    if (!signal_create_room(n->sig, room_out, room_cap, timeout)) {
       set_err(signal_error());
       goto fail;
     }
@@ -420,7 +379,7 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
 
   // The one place the program is idle on purpose: nothing can happen until a
   // human somewhere else types the code.
-  if (!signal_wait_peer(&n->sig, is_host, timeout)) {
+  if (!signal_wait_peer(n->sig, is_host, timeout)) {
     set_err(signal_error());
     goto fail;
   }
@@ -435,7 +394,7 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
   // to discover "nothing left" without stalling the game.
   fcntl(n->pipe[0], F_SETFL, O_NONBLOCK);
 
-  juice_turn_server_t turn = {0};
+  juice_turn_server_t turn[NET_MAX_TURN] = {0};
   juice_config_t jc = {
       .concurrency_mode = JUICE_CONCURRENCY_MODE_POLL,
       .stun_server_host = cfg->stun_host,
@@ -446,13 +405,16 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
       .cb_recv = on_recv,
       .user_ptr = n,
   };
-  if (cfg->turn_host) {
-    turn.host = cfg->turn_host;
-    turn.port = (unsigned short)cfg->turn_port;
-    turn.username = cfg->turn_user;
-    turn.password = cfg->turn_pass;
-    jc.turn_servers = &turn;
-    jc.turn_servers_count = 1;
+  int nturn = cfg->turn_count > NET_MAX_TURN ? NET_MAX_TURN : cfg->turn_count;
+  for (int i = 0; i < nturn; i++) {
+    turn[i].host = cfg->turn[i].host;
+    turn[i].port = (unsigned short)cfg->turn[i].port;
+    turn[i].username = cfg->turn[i].user;
+    turn[i].password = cfg->turn[i].pass;
+  }
+  if (nturn) {
+    jc.turn_servers = turn;
+    jc.turn_servers_count = nturn;
   }
 
   n->agent = juice_create(&jc);
@@ -467,53 +429,43 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
   plum_config_t pc = {.log_level = PLUM_LOG_LEVEL_NONE};
   plum_init(&pc);
 
-  if (cfg->ice_timeout_ms < 0)
-    go_relay(n); // caller does not want a direct path at all
-
   // Whoever describes itself first becomes the ICE controlling agent. If both
   // do it, libjuice logs a role conflict and has to resolve it by tie-breaker.
   // The host offers; the guest answers only after applying the offer.
   int desc_sent = 0, remote_desc = 0;
-  if (n->mode == MODE_ICE && *is_host && !offer(n))
+  if (*is_host && !offer(n))
     goto fail;
   desc_sent = *is_host;
 
   // The wait for a human to type the code is over; from here we are only
-  // waiting on machines, and a much shorter budget applies. Running out is not
-  // a failure -- it is the signal to relay instead.
+  // waiting on machines, so a much shorter budget applies. Running out means
+  // no path exists, which is a clean failure.
   long long deadline =
       now_ms() + (cfg->ice_timeout_ms > 0 ? cfg->ice_timeout_ms : 20000);
   for (;;) {
-    int st = atomic_load(&n->state);
-    if (st == JUICE_STATE_COMPLETED || n->mode == MODE_RELAY)
+    if (atomic_load(&n->state) == JUICE_STATE_COMPLETED)
       break;
-
     if (now_ms() >= deadline) {
-      go_relay(n);
-      break;
-    }
-    int wait = (int)(deadline - now_ms());
-
-    struct pollfd fds[2] = {
-        {.fd = signal_fd(&n->sig), .events = POLLIN},
-        {.fd = n->pipe[0], .events = POLLIN},
-    };
-    int rc = poll(fds, 2, wait > 250 ? 250 : wait);
-    if (rc < 0) {
-      if (errno == EINTR)
-        continue;
-      set_err(strerror(errno));
+      if (n->signaling_done)
+        set_err(n->signaling_reason);
+      else
+        set_err("timed out establishing a connection (no direct path, and no "
+                "TURN relay reachable)");
       goto fail;
     }
 
-    if (fds[0].revents & POLLIN) {
-      char line[SIGNAL_LINE];
-      int lr = signal_line(&n->sig, line, sizeof line, 0);
-      if (lr < 0) {
-        set_err(signal_error());
-        goto fail;
-      }
-      if (lr == 1 && !on_signal_line(n, line, &remote_desc))
+    // The websocket is driven by libwebsockets rather than our poll loop, so
+    // pump it briefly and then look at the ICE pipe. This lasts seconds, only
+    // during setup, and ends before the game does any work.
+    if (!n->signaling_done && signal_service(n->sig, 20) < 0) {
+      n->signaling_done = 1;
+      snprintf(n->signaling_reason, sizeof n->signaling_reason,
+               "the signaling connection dropped during setup");
+    }
+
+    char msg[SIGNAL_MSG_MAX + 1];
+    while (signal_next(n->sig, msg, sizeof msg)) {
+      if (!on_signal_msg(n, msg, &remote_desc))
         goto fail;
       if (!desc_sent && remote_desc) {
         if (!offer(n))
@@ -522,16 +474,21 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
       }
     }
 
-    if (fds[1].revents & POLLIN) {
+    for (;;) {
       char rec[1 + NET_MAX_DATAGRAM];
       ssize_t r = read(n->pipe[0], rec, sizeof rec);
-      if (r > 0 && !on_pipe_record(n, rec, (int)r, 1))
+      if (r <= 0)
+        break;
+      if (!on_pipe_record(n, rec, (int)r, 1))
         goto fail;
     }
   }
 
-  // The signaling socket deliberately stays open for the whole game: it is the
-  // relay of last resort, and it costs one idle TCP connection to keep.
+  // ICE has a path, so signaling has done its entire job. Closing here is what
+  // guarantees no game packet can ever travel through it.
+  signal_close(n->sig);
+  n->sig = NULL;
+
   *out = n;
   return 1;
 
@@ -542,7 +499,7 @@ fail:
     plum_cleanup();
     juice_destroy(n->agent);
   }
-  signal_close(&n->sig);
+  signal_close(n->sig);
   if (n->pipe[0] >= 0)
     close(n->pipe[0]);
   if (n->pipe[1] >= 0)
@@ -553,27 +510,7 @@ fail:
 
 // ------------------------------------------------------------------- data ---
 
-// Relayed payloads travel as one signaling line, so the trailing newline that
-// proto.c puts on every message has to come off and go back on again.
-static int relay_send(Net *n, const char *buf, int len) {
-  char payload[PROTO_LINE_CAP];
-  while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-    len--;
-  if (len <= 0 || len >= (int)sizeof payload)
-    return 0;
-  memcpy(payload, buf, (size_t)len);
-  payload[len] = '\0';
-  return signal_send(&n->sig, "RELAY", payload);
-}
-
 int net_send(Net *n, const char *buf, int len) {
-  if (n->mode == MODE_ICE) {
-    int st = atomic_load(&n->state);
-    if (st == JUICE_STATE_FAILED || st == JUICE_STATE_DISCONNECTED)
-      go_relay(n);
-  }
-  if (n->mode == MODE_RELAY)
-    return relay_send(n, buf, len);
   return juice_send(n->agent, buf, (size_t)len) == 0;
 }
 
@@ -588,11 +525,13 @@ int net_recv(Net *n, char *buf, int cap) {
     return len;
   }
 
+  // One source only. Signaling is closed by the time the game runs, so there
+  // is no second path a game packet could arrive on.
   for (;;) {
     char rec[1 + NET_MAX_DATAGRAM];
     ssize_t r = read(n->pipe[0], rec, sizeof rec);
     if (r <= 0)
-      break; // the ICE side is drained
+      return 0;
     if (rec[0] == TAG_DATA) {
       int len = (int)r - 1;
       if (len > cap)
@@ -601,36 +540,6 @@ int net_recv(Net *n, char *buf, int cap) {
       return len;
     }
     on_pipe_record(n, rec, (int)r, 0); // state changes and late candidates
-  }
-
-  // Then the relay. Reading this even while ICE looks healthy is what lets a
-  // peer that has already given up drag us over to the relay with it.
-  for (;;) {
-    char line[SIGNAL_LINE];
-    int lr = signal_line(&n->sig, line, sizeof line, 0);
-    if (lr == 0)
-      return 0;
-    if (lr < 0) {
-      signal_close(&n->sig);
-      return 0;
-    }
-    if (!strncmp(line, "RELAY ", 6)) {
-      go_relay(n);
-      int len = (int)strlen(line + 6);
-      if (len == 0)
-        continue; // bare marker: the peer switched, there is no datagram here
-      if (len > cap)
-        len = cap;
-      memcpy(buf, line + 6, (size_t)len);
-      return len;
-    }
-    if (!strcmp(line, "PEERGONE") || !strncmp(line, "ERR", 3)) {
-      set_err(line);
-      signal_close(&n->sig);
-      return 0;
-    }
-    int ignored = 0;
-    on_signal_line(n, line, &ignored); // late trickled candidates
   }
 }
 
@@ -642,7 +551,7 @@ void net_close(Net *n) {
   plum_cleanup();
   if (n->agent)
     juice_destroy(n->agent); // joins the juice thread before the pipe closes
-  signal_close(&n->sig);
+  signal_close(n->sig);      // normally already closed when ICE connected
   if (n->pipe[0] >= 0)
     close(n->pipe[0]);
   if (n->pipe[1] >= 0)
