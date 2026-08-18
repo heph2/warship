@@ -13,3 +13,8 @@ a.out
 compile_commands.json
 .cache/
 warship
+test_board
+test_proto
+test_signaling
+test_net
+rendezvous
