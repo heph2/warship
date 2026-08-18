@@ -14,6 +14,10 @@
 //   -> BYE                  <- PEERGONE                 the other side left
 //                           <- ERROR <reason>
 //
+// A plain HTTP GET answers 200 with a one-line status. The service speaks only
+// websockets otherwise, so without this a browser or an uptime check gets a
+// failed upgrade, which reads as an outage rather than as "wrong protocol".
+//
 // The payload of SIGNAL is never parsed here. It happens to be an SDP
 // description or an ICE candidate, but this service has no opinion about that
 // and must not grow one.
@@ -34,8 +38,12 @@
 #define MAX_MSG 8192   // an SDP description plus a verb, with room to spare
 #define MAX_QUEUE 8    // outbound messages held per client
 #define CODE_LEN 6
-#define LONELY_TIMEOUT_S 120 // waiting alone in a room
-#define ROOM_LIFETIME_S 300  // signaling is seconds of work; this is generous
+// Waiting alone in a room. Generous on purpose: the code is only shown after
+// the host has placed its fleet, and the other player has to receive it, start
+// the program and place their own fleet before they can join. Two minutes
+// covered someone already sitting at a terminal and nothing else.
+#define LONELY_TIMEOUT_S 600
+#define ROOM_LIFETIME_S 900 // an upper bound, not an expected duration
 
 // No 0/o/1/l/i: codes get read aloud and typed by hand.
 static const char CODE_ALPHABET[] = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -393,7 +401,38 @@ static int callback_signaling(struct lws *wsi, enum lws_callback_reasons reason,
   }
 }
 
+// Anything that is not a websocket upgrade lands here, because lws routes
+// plain HTTP to the vhost's first protocol.
+static int callback_health(struct lws *wsi, enum lws_callback_reasons reason,
+                           void *user, void *in, size_t len) {
+  (void)user;
+  (void)in;
+  (void)len;
+
+  if (reason != LWS_CALLBACK_HTTP)
+    return 0;
+
+  static const char body[] = "warship signaling ok\n";
+  unsigned char buf[LWS_PRE + 512];
+  unsigned char *p = buf + LWS_PRE;
+  unsigned char *end = buf + sizeof buf;
+
+  if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "text/plain",
+                                  sizeof body - 1, &p, end))
+    return 1;
+  if (lws_finalize_write_http_header(wsi, buf + LWS_PRE, &p, end))
+    return 1;
+
+  unsigned char out[LWS_PRE + sizeof body];
+  memcpy(out + LWS_PRE, body, sizeof body - 1);
+  if (lws_write(wsi, out + LWS_PRE, sizeof body - 1, LWS_WRITE_HTTP_FINAL) < 0)
+    return 1;
+
+  return lws_http_transaction_completed(wsi) ? -1 : 0;
+}
+
 static const struct lws_protocols protocols[] = {
+    {"http", callback_health, 0, 0, 0, NULL, 0},
     {"warship-signaling", callback_signaling, sizeof(Session), MAX_MSG, 0, NULL, 0},
     LWS_PROTOCOL_LIST_TERM,
 };

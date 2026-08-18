@@ -2,6 +2,7 @@
 
 #include "ui.h"
 
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,9 +64,38 @@ void ui_init(void) {
   (void)!write(STDOUT_FILENO, "\x1b[?25l", 6); // hide hardware cursor
 }
 
+// Read one byte, but only if one is already waiting. Distinguishing an arrow
+// key from someone pressing Escape means asking "is there more?", and the
+// answer has to time out or a bare Escape would hang the game.
+static int ui_key_pending(int timeout_ms) {
+  struct pollfd p = {.fd = STDIN_FILENO, .events = POLLIN};
+  if (poll(&p, 1, timeout_ms) != 1)
+    return -1;
+  unsigned char c;
+  return (read(STDIN_FILENO, &c, 1) == 1) ? (int)c : -1;
+}
+
 int ui_key(void) {
-  char c;
-  return (read(STDIN_FILENO, &c, 1) == 1) ? (unsigned char)c : -1;
+  unsigned char c;
+  if (read(STDIN_FILENO, &c, 1) != 1)
+    return -1;
+  if (c != 0x1b)
+    return c;
+
+  // ESC [ A  in normal mode, ESC O A in application cursor mode. Terminals
+  // use both, and which one you get depends on the terminal's current state
+  // rather than on anything we control, so accept either.
+  int second = ui_key_pending(30);
+  if (second != '[' && second != 'O')
+    return 0x1b; // a real Escape, or something we do not handle
+
+  switch (ui_key_pending(30)) {
+  case 'A': return UI_KEY_UP;
+  case 'B': return UI_KEY_DOWN;
+  case 'C': return UI_KEY_RIGHT;
+  case 'D': return UI_KEY_LEFT;
+  default:  return 0x1b;
+  }
 }
 
 // Bounded append, never writes past cap-1. Returns the new length.
@@ -133,7 +163,7 @@ void ui_draw_placement(const Board *b, int row, int col, int vert) {
                STATUS_ROW);
 
   n = append(buf, n, cap,
-             "\x1b[%d;1Hwasd move  r rotate  space place  u undo  q quit",
+             "\x1b[%d;1Hwasd/arrows move  r rotate  space place  u undo  q quit",
              HELP_ROW);
 
   (void)!write(STDOUT_FILENO, buf, (size_t)n);
@@ -170,7 +200,8 @@ void ui_draw_battle(const Board *own, const Track *t, int row, int col,
   }
 
   n = append(buf, n, cap, "\x1b[%d;1H%s", STATUS_ROW, status);
-  n = append(buf, n, cap, "\x1b[%d;1Hwasd move  space fire  q quit   [%c%d]",
+  n = append(buf, n, cap,
+             "\x1b[%d;1Hwasd/arrows move  space fire  q quit   [%c%d]",
              HELP_ROW, 'A' + col, row + 1);
 
   (void)!write(STDOUT_FILENO, buf, (size_t)n);

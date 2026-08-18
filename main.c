@@ -61,10 +61,10 @@ static int placement_loop(Board *b) {
     ui_draw_placement(b, row, col, vert);
 
     switch (ui_key()) {
-    case 'w': if (row > 0)       row--; break;
-    case 's': if (row < max_row) row++; break;
-    case 'a': if (col > 0)       col--; break;
-    case 'd': if (col < max_col) col++; break;
+    case 'w': case UI_KEY_UP:    if (row > 0)       row--; break;
+    case 's': case UI_KEY_DOWN:  if (row < max_row) row++; break;
+    case 'a': case UI_KEY_LEFT:  if (col > 0)       col--; break;
+    case 'd': case UI_KEY_RIGHT: if (col < max_col) col++; break;
     case 'r': vert = !vert; break;
     case ' ':
       if (b->placed < NSHIPS && board_can_place(b, row, col, len, vert))
@@ -198,10 +198,10 @@ static void on_message(Game *g, const Msg *m) {
 
 static void on_key(Game *g, int key) {
   switch (key) {
-  case 'w': if (g->row > 0)        g->row--; break;
-  case 's': if (g->row < SIZE - 1) g->row++; break;
-  case 'a': if (g->col > 0)        g->col--; break;
-  case 'd': if (g->col < SIZE - 1) g->col++; break;
+  case 'w': case UI_KEY_UP:    if (g->row > 0)        g->row--; break;
+  case 's': case UI_KEY_DOWN:  if (g->row < SIZE - 1) g->row++; break;
+  case 'a': case UI_KEY_LEFT:  if (g->col > 0)        g->col--; break;
+  case 'd': case UI_KEY_RIGHT: if (g->col < SIZE - 1) g->col++; break;
   case ' ':
     if (g->st != ST_MY_TURN)
       break;

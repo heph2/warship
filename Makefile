@@ -23,11 +23,14 @@ test_net: $(NET_OBJ) test_net.o
 
 # Needs a live server, so it stays out of `make test`.
 itest: signal-server test_signaling test_net
-	@./signal-server 17778 >/dev/null 2>&1 & pid=$$!; sleep 0.6; \
-	  ./test_signaling 17778 && ./test_net 17778 && ./test_net 17778 nopath; \
+	@# A per-run port. Back-to-back runs otherwise collide on a socket the
+	@# previous server has not finished releasing, which looks like a flaky test.
+	@port=$$((18000 + $$$$ % 1000)); \
+	  ./signal-server $$port >/dev/null 2>&1 & pid=$$!; sleep 0.6; \
+	  port=$$((18000 + $$$$ % 1000)); \
+	  ./test_signaling $$port && ./test_net $$port && ./test_net $$port nopath; \
 	  rc=$$?; \
-	  kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; \
-	  sleep 0.3; exit $$rc   # let 17778 be released before the next run
+	  kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; exit $$rc
 
 # Regression test against the real pochi.casa deployment.
 prod-check: test_signaling test_net

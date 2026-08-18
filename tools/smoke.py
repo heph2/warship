@@ -54,12 +54,17 @@ class Peer:
         self.proc.wait(timeout=5)
 
 
-def place_fleet(p):
-    """Five ships in rows 1-5, all starting at column A, horizontal."""
+def place_fleet(p, arrows=False):
+    """Five ships in rows 1-5, all starting at column A, horizontal.
+
+    `arrows` drives the same placement with cursor keys, so both input paths
+    are covered by a real run rather than only by reading the code.
+    """
+    down = "\x1b[B" if arrows else "s"
     for i in range(5):
         p.send(" ")   # commit the current ship at the cursor
         if i < 4:
-            p.send("s")  # next row
+            p.send(down)
     p.send("\r")
 
 
@@ -84,11 +89,15 @@ def main():
 
         guest = Peer(["./warship", "join", code] + base)
         assert guest.wait_for("placing Carrier", 10), "guest never showed placement"
-        place_fleet(guest)
+        place_fleet(guest, arrows=True)  # the guest plays with cursor keys
 
         assert host.wait_for("your turn", 60), "host never got the turn"
         assert guest.wait_for("their turn", 60), "guest never saw the host's turn"
 
+        # Move right then back with arrows before firing, so a broken arrow
+        # decoder shows up as a shot at the wrong square rather than silence.
+        host.send("\x1b[C")
+        host.send("\x1b[D")
         host.send(" ")  # fire at A1, where the guest's Carrier sits
         assert host.wait_for("hit at A1", 20), "host never saw its hit"
         assert guest.wait_for("they hit your Carrier at A1", 20), \

@@ -65,6 +65,10 @@ checking the room no longer exists.
 - **Trust boundaries.** `proto_parse` and `handle_message` in the server take
   bytes from strangers. Range-check numbers, reject trailing garbage, reject
   unprintable bytes. An ANSI escape in a nick rewrites the opponent's terminal.
+- **Arrow keys are escape sequences**, so `ui_key()` decodes them and returns
+  values above 255. Deciding whether an ESC begins an arrow or is a bare
+  Escape means polling for a follow-up byte with a short timeout; terminals
+  send `ESC [ A` or `ESC O A` depending on cursor-key mode, so accept both.
 - **Frames never contain newlines.** `ui.c` positions everything with explicit
   `ESC[row;colH` and writes one buffer per frame. A stray `\n` reintroduces
   scrolling and flicker.

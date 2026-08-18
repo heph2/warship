@@ -27,7 +27,8 @@ make
 ./warship join <code>
 ```
 
-`wasd` to move, `r` to rotate, `space` to place and to fire, `q` to quit.
+`wasd` or the arrow keys to move, `r` to rotate, `space` to place and to fire,
+`q` to quit.
 
 ## Connecting
 
@@ -62,10 +63,6 @@ does not parse ICE, terminate TLS, or relay anything.
 
 ## Next
 
-- **Rooms expire in 120 seconds while nobody has joined**, but the code only
-  appears after you place your ships, and your opponent has to place theirs
-  before joining. Raise `LONELY_TIMEOUT_S`: today it works if they are already
-  at a terminal, and fails if you text them the code.
 - **Reconnect.** A dropped connection ends the game. Both boards are still in
   memory on both sides, so resuming from a room code is mostly plumbing.
 - **`--peer <ip:port>`** to skip signaling entirely for LAN play, feeding a
@@ -73,9 +70,8 @@ does not parse ICE, terminate TLS, or relay anything.
   signaling service is a convenience rather than a dependency.
 - **Commit-reveal.** Each side reports its own hits, so a modified client can
   lie. Hash the layout at READY, reveal at game end, verify.
-- **A health endpoint on signaling**, so `curl https://signal.pochi.casa/`
-  answers 200 instead of 502. It only speaks websocket today, which is correct
-  and looks broken.
+- **IPv4.** Everything is IPv6-only today, which is fine for pochi.casa and
+  excludes anyone whose network is not.
 
 ## Tests
 

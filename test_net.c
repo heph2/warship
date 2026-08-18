@@ -152,8 +152,14 @@ static int deaf_peer(const char *code) {
   }
   // Stay connected, stay silent, and outlive the other side's ICE budget by a
   // clear margin so the timeout path is what gets exercised.
-  for (long long deadline = now_ms() + 8000; now_ms() < deadline;)
-    signal_service(s, 20);
+  long long deadline = now_ms() + 8000;
+  while (now_ms() < deadline) {
+    if (signal_service(s, 20) < 0) {
+      fprintf(stderr, "deaf peer: signaling dropped after %lldms: %s\n",
+              8000 - (deadline - now_ms()), signal_error());
+      return 1;
+    }
+  }
   signal_close(s);
   return 0;
 }
@@ -239,7 +245,12 @@ int main(int argc, char **argv) {
       fprintf(stderr, "expected failure, but connected via %s\n", net_route(n));
       return 1;
     }
-    if (!strstr(net_error(), "timed out")) {
+    // Either clean failure is acceptable. What is being tested is that no
+    // path means an error rather than a silent fallback; whether we notice by
+    // running out of ICE budget or by the room collapsing first is a race we
+    // do not control, and both leave the game refusing to start.
+    if (!strstr(net_error(), "timed out") &&
+        !strstr(net_error(), "signaling service")) {
       fprintf(stderr, "wrong error: %s\n", net_error());
       return 1;
     }
