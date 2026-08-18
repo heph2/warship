@@ -73,10 +73,15 @@ if [ -z "${WARSHIP_TURN_PASSWORD:-}" ]; then
 elif ! command -v turnutils_uclient >/dev/null 2>&1; then
   skipd "TURN allocation" "no turnutils_uclient (nix shell nixpkgs#coturn)"
 else
-  if out=$(timeout 25 turnutils_uclient -T -6 -n 2 \
+  # -x IPv6 relay, -y client-to-client (two allocations talking to each other,
+  # which is exactly the shape a relayed game takes), -c no rtcp stream.
+  # The positional argument is an address, not a name.
+  turn_ip=$(getent ahostsv6 "$TURN_HOST" 2>/dev/null | awk '{print $1}' | head -1)
+  if out=$(timeout 60 turnutils_uclient -x -y -c -n 2 \
              -u "${WARSHIP_TURN_USER:-warship}" -w "$WARSHIP_TURN_PASSWORD" \
-             -p "$TURN_PORT" "$TURN_HOST" 2>&1); then
-    ok "relay allocation succeeded over IPv6"
+             -p "$TURN_PORT" "$turn_ip" 2>&1) &&
+     echo "$out" | grep -q "tot_recv_msgs=[1-9]"; then
+    ok "relay allocation over IPv6: $(echo "$out" | grep -o 'tot_send_msgs=[0-9]*, tot_recv_msgs=[0-9]*' | tail -1)"
   else
     bad "TURN allocation failed: check the password and the 49160-49200/udp range"
     echo "$out" | sed 's/^/       /' | tail -5
