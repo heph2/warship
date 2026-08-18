@@ -20,39 +20,49 @@ Two players, one room code. No accounts, no lobby, no launcher.
 ## Play
 
 ```sh
-nix develop          # or install libjuice + libplum yourself
+nix develop          # or install libjuice, libplum and libwebsockets yourself
 make
 
-./warship host --signal your.server:7777    # prints a room code
-./warship join <code> --signal your.server:7777
+./warship host --signal-url wss://signal.example.com/    # prints a room code
+./warship join <code> --signal-url wss://signal.example.com/
 ```
 
 `wasd` to move, `r` to rotate, `space` to place and to fire, `q` to quit.
 
 ## Connecting
 
-ICE via [libjuice](https://github.com/paullouisageneau/libjuice), with two additions so a relay is rarely needed:
+ICE via [libjuice](https://github.com/paullouisageneau/libjuice). Game traffic
+only ever travels over ICE — direct, through a port the router opened, or via a
+coturn relay candidate.
 
-- **Port mapping** — [libplum](https://github.com/paullouisageneau/libplum) asks the router directly over NAT-PMP, PCP or UPnP-IGD. STUN only discovers what a NAT already did; this asks it to cooperate.
-- **Relay of last resort** — when no direct path exists, the game falls back to the rendezvous connection it already has. No TURN deployment required, though TURN is used when configured.
+- **Signaling** is a small WebSocket service used to pair two players by room
+  code and pass ICE payloads between them. It closes the moment ICE connects and
+  never carries a game packet.
+- **Port mapping** — [libplum](https://github.com/paullouisageneau/libplum) asks
+  the router directly over NAT-PMP, PCP or UPnP-IGD. STUN only discovers what a
+  NAT already did; this asks it to cooperate, which keeps most games off the
+  relay.
+- **coturn** is the only relay. If no path exists at all, you get a clean error
+  rather than a silent fallback.
 
-The status line reports which path won: `host`, `port-mapped`, `srflx`, `relay` or `signal-relay`.
+The status line reports which path won: `host`, `port-mapped`, `srflx` or `relay`.
 
 ## Server
 
-One small binary, the only thing that needs a public address.
+Signaling behind a reverse proxy, plus coturn. See [deploy/](deploy/) for a
+compose file, a Caddyfile, an nginx alternative and a coturn config.
 
 ```sh
-docker build -t warship-rendezvous ./server
-docker run -d --restart=unless-stopped -p 7777:7777 warship-rendezvous
+cd deploy && docker compose up -d
 ```
 
-Under 200 kB. It pairs peers by room code, forwards opaque lines, and never parses ICE.
+The signaling service pairs peers by room code and forwards opaque payloads. It
+does not parse ICE, terminate TLS, or relay anything.
 
 ## Tests
 
 ```sh
 make test     # game rules and protocol, no network
-make itest    # signaling, ICE and relay over loopback
+make itest    # signaling and ICE over loopback, plus the no-path failure
 make smoke    # two real processes on ptys, playing a turn
 ```

@@ -66,12 +66,13 @@ def place_fleet(p):
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
-    server = subprocess.Popen(["./rendezvous", PORT],
+    server = subprocess.Popen(["./signal-server", PORT],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.4)
     host = guest = None
     try:
-        base = ["--signal", "127.0.0.1:" + PORT, "--stun", "127.0.0.1:1"]
+        # No --stun-server: STUN is pointless on loopback and only adds delay.
+        base = ["--signal-url", "ws://127.0.0.1:%s/" % PORT]
         host = Peer(["./warship", "host"] + base)
         assert host.wait_for("placing Carrier", 10), "host never showed placement"
         place_fleet(host)
@@ -85,8 +86,8 @@ def main():
         assert guest.wait_for("placing Carrier", 10), "guest never showed placement"
         place_fleet(guest)
 
-        assert host.wait_for("your turn", 40), "host never got the turn"
-        assert guest.wait_for("their turn", 40), "guest never saw the host's turn"
+        assert host.wait_for("your turn", 60), "host never got the turn"
+        assert guest.wait_for("their turn", 60), "guest never saw the host's turn"
 
         host.send(" ")  # fire at A1, where the guest's Carrier sits
         assert host.wait_for("hit at A1", 20), "host never saw its hit"

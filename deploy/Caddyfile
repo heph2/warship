@@ -1,0 +1,16 @@
+# Caddy gets a certificate automatically and terminates wss:// here. The
+# signaling service speaks plain ws:// behind it and never sees a private key.
+#
+# Websocket upgrades need no special configuration in Caddy: reverse_proxy
+# passes them through as they are.
+
+signal.example.com {
+	encode gzip
+	reverse_proxy signal:7777 {
+		# Signaling connections are idle for as long as it takes a human to
+		# read a room code out loud, then they close. Do not cut them short.
+		transport http {
+			read_timeout 10m
+		}
+	}
+}

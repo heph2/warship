@@ -12,9 +12,9 @@ Everything runs inside the nix dev shell (`direnv reload` after touching
 ```sh
 make          # warship
 make test     # board rules, protocol, candidate parsing -- no network
-make itest    # signaling, ICE and relay over loopback; starts its own server
+make itest    # signaling and ICE over loopback; starts its own server
 make smoke    # two real processes on ptys through a full turn; needs python3
-make rendezvous
+make signal-server
 ```
 
 `make test` must stay network-free and must stay fast. Anything needing a
@@ -26,10 +26,10 @@ socket belongs in `itest`.
 board.c    game rules. No I/O of any kind. State hangs off a Board*.
 proto.c    wire format + stop-and-wait reliability. No sockets, no clock.
 ui.c       the only file that touches the terminal.
-signaling.c  TCP client for the rendezvous server.
+signaling.c  websocket client for the signaling service.
 net.c      libjuice + libplum, and the only file with a foreign thread.
 main.c     argument parsing, poll() loop, game state machine.
-server/rendezvous.c   the public daemon. Links nothing else in this repo.
+server/signaling_server.c   the public daemon. Links nothing else in this repo.
 ```
 
 The rule: **purity buys testability.** `board.c` and `proto.c` take their time
@@ -38,8 +38,14 @@ delivery and retransmit timeouts are ordinary function calls in the tests. Do
 not add I/O, a clock, or a global to either. If a new module can be pure, make
 it pure.
 
-`server/rendezvous.c` must never include a game header. If it needs one, the
-layering is wrong.
+`server/signaling_server.c` must never include a game header. If it needs one,
+the layering is wrong.
+
+**Signaling must never carry game traffic.** It exists to pair two players and
+pass opaque ICE payloads, and `net_open` closes it the instant ICE connects.
+When no path can be found the answer is a clean error, not a fallback: coturn
+is the only relay. `test_net` proves the websocket is gone after connecting by
+checking the room no longer exists.
 
 ## Invariants worth knowing before editing
 
@@ -47,7 +53,7 @@ layering is wrong.
   callback does exactly one thing: write a tagged record into the socketpair in
   `net.c`. The main loop owns all game state and the signaling socket. There
   are no mutexes and it should stay that way.
-- **Trust boundaries.** `proto_parse` and `handle_line` in the server take
+- **Trust boundaries.** `proto_parse` and `handle_message` in the server take
   bytes from strangers. Range-check numbers, reject trailing garbage, reject
   unprintable bytes. An ANSI escape in a nick rewrites the opponent's terminal.
 - **Frames never contain newlines.** `ui.c` positions everything with explicit
@@ -68,12 +74,22 @@ layering is wrong.
   header.
 - libjuice and libplum are **not in nixpkgs**. `flake.nix` builds both from
   source, pinned by tag and hash. libjuice ships no `.pc` file, so they live in
-  `buildInputs` and the Makefile just says `-ljuice -lplum`.
-- Writes to the signaling socket use `MSG_NOSIGNAL`. It carries game traffic
-  once relaying, and a vanished peer would otherwise kill the process.
-- Loopback ICE completes in roughly a millisecond. Do not try to force the
-  relay path with a short timeout; use a negative `ice_timeout_ms`, which skips
-  ICE outright.
+  `buildInputs` and the Makefile just says `-ljuice -lplum -lwebsockets`.
+  libwebsockets comes from nixpkgs but its public header includes
+  `<openssl/ssl.h>`, so OpenSSL has to be in `buildInputs` too.
+- **libjuice does TURN over UDP only.** `juice_turn_server_t` has no transport
+  field, so `turns:` on 5349 cannot be configured. Do not add a flag for it.
+- `lws_callback_on_writable()` called from outside the event loop is not enough
+  on its own; pair it with `lws_cancel_service()` or only the first message of
+  a connection is ever sent. This cost an afternoon.
+- One libwebsockets context per process. Interleaving several in one thread is
+  a shape the product never has, and the tests fork rather than try.
+- Loopback ICE completes in roughly a millisecond, so timing knobs are a poor
+  way to force a particular path in tests.
+- Signaling ending mid-handshake is **not** a failure. Whoever completes ICE
+  first closes its websocket, which collapses the room and hands the other peer
+  a `PEERGONE` while it is still finishing. It only means no more candidates
+  are coming.
 - `snprintf` into a buffer that is also the source is an overlapping copy. It
   produced an empty room code once.
 

@@ -1,0 +1,43 @@
+# Minimal production deployment: signaling behind Caddy, coturn for relay.
+#
+# Externally this exposes 443/tcp (HTTPS + WSS), 3478/udp and 3478/tcp
+# (STUN/TURN), and coturn's relay range 49160-49200/udp. The relay range is
+# easy to forget and TURN silently fails without it.
+#
+# coturn runs on the host network on purpose: relaying through a bridge means
+# publishing thousands of ports, and coturn needs to see the real client
+# addresses to allocate correctly.
+
+services:
+  signal:
+    build: ../server
+    restart: unless-stopped
+    # Not published: Caddy is the only thing that talks to it.
+    expose:
+      - "7777"
+    command: ["7777"]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - signal
+
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+
+volumes:
+  caddy_data:
+  caddy_config:
