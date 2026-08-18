@@ -61,10 +61,17 @@ int net_recv(Net *n, char *buf, int cap);
 
 int net_alive(const Net *n); // 0 once neither ICE nor the relay can carry data
 
-// "host", "srflx", "relay" (TURN) or "signal-relay" (through the rendezvous
-// server, the fallback that needs no TURN deployment at all).
+// "host", "port-mapped" (the router opened a port for us), "srflx", "relay"
+// (TURN) or "signal-relay" (through the rendezvous server, the fallback that
+// needs no TURN deployment at all).
 const char *net_route(const Net *n);
 void net_close(Net *n);
 const char *net_error(void);
+
+// Candidate rewriting, exposed because it is pure string handling and the one
+// part of the mapping path that can be tested without a router.
+int net_parse_host_candidate(const char *cand, char *ip, int ipcap, int *port);
+int net_mapped_candidate(const char *host_cand, const char *ext_ip, int ext_port,
+                         char *out, int cap);
 
 #endif

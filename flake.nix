@@ -35,9 +35,32 @@
             platforms = pkgs.lib.platforms.unix;
           };
         });
+        # Port mapping: NAT-PMP, PCP and UPnP-IGD behind one API. Same author as
+        # libjuice and meant to pair with it. Also absent from nixpkgs.
+        libplum = pkgs.stdenv.mkDerivation (finalAttrs: {
+          pname = "libplum";
+          version = "0.6.0";
+
+          src = pkgs.fetchFromGitHub {
+            owner = "paullouisageneau";
+            repo = "libplum";
+            rev = "v${finalAttrs.version}";
+            hash = "sha256-WFxdYBLrqaExjl0JR2KxXYfdNaxiyfI1NxCTjixCwJQ=";
+          };
+
+          nativeBuildInputs = with pkgs; [ cmake pkg-config ];
+
+          meta = {
+            description = "Multi-protocol port mapping client library";
+            homepage = "https://github.com/paullouisageneau/libplum";
+            license = pkgs.lib.licenses.mpl20;
+            platforms = pkgs.lib.platforms.unix;
+          };
+        });
       in
       {
         packages.libjuice = libjuice;
+        packages.libplum = libplum;
 
         devShells.default = pkgs.mkShell {
           name = "warship-dev";
@@ -59,13 +82,13 @@
           # Libraries we link against. These belong in buildInputs, not
           # packages: only buildInputs makes the cc wrapper add the -I and -L
           # paths, and libjuice ships no pkg-config file to fall back on.
-          buildInputs = [ libjuice ];
+          buildInputs = [ libjuice libplum ];
 
           shellHook = ''
             echo "warship C/C++ dev shell"
             echo "  cc: $(gcc --version | head -n1)"
             echo "  make: $(make --version | head -n1)"
-            echo "  libjuice: ${libjuice.version}"
+            echo "  libjuice: ${libjuice.version}  libplum: ${libplum.version}"
           '';
         };
       }

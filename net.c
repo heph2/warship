@@ -4,6 +4,7 @@
 #include "signaling.h"
 
 #include <juice/juice.h>
+#include <plum/plum.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -21,6 +22,7 @@
 #define TAG_CAND 'C'  // we gathered a local candidate, forward it to the peer
 #define TAG_DONE 'G'  // local gathering finished
 #define TAG_STATE 'S' // ICE state changed
+#define TAG_MAP 'M'   // the router gave us an external ip:port
 
 #define MAX_PENDING 4 // early datagrams held during the handshake
 #define PROTO_LINE_CAP 512 // one relayed message; proto.c caps its lines at 256
@@ -34,6 +36,16 @@ typedef enum {
 struct Net {
   juice_agent_t *agent;
   Mode mode;
+
+  // Port mapping. libjuice speaks STUN but never asks the router directly, so
+  // a NAT that would happily open a port never gets asked. libplum asks, over
+  // NAT-PMP, PCP and UPnP-IGD, and the result is advertised to the peer as one
+  // more candidate. This is what keeps games off the relay.
+  int mapping_id;
+  int mapping_asked;
+  char host_cand[JUICE_MAX_CANDIDATE_SDP_STRING_LEN + 1]; // template to rewrite
+  char host_ip[64];
+  int host_port;
   int pipe[2]; // [0] read by main loop, [1] written by the juice thread
   atomic_int state;
   Signal sig;
@@ -92,6 +104,69 @@ static void on_gathering_done(juice_agent_t *a, void *user) {
 static void on_recv(juice_agent_t *a, const char *data, size_t size, void *user) {
   (void)a;
   push((Net *)user, TAG_DATA, data, (int)size);
+}
+
+// Also a foreign thread. Same rule: write to the pipe, touch nothing else.
+static void on_mapping(int id, plum_state_t state, const plum_mapping_t *mapping) {
+  (void)id;
+  if (state != PLUM_STATE_SUCCESS || !mapping || !mapping->user_ptr)
+    return;
+  char line[PLUM_MAX_HOST_LEN + 16];
+  int n = snprintf(line, sizeof line, "%s %u", mapping->external_host,
+                   (unsigned)mapping->external_port);
+  if (n > 0 && n < (int)sizeof line)
+    push((Net *)mapping->user_ptr, TAG_MAP, line, n);
+}
+
+// -------------------------------------------------------- port mapping ---
+
+// "a=candidate:1 1 UDP 2130706431 192.168.1.9 51234 typ host"
+// Returns 1 for an IPv4 host candidate, filling ip and port.
+int net_parse_host_candidate(const char *cand, char *ip, int ipcap, int *port) {
+  const char *p = strstr(cand, "candidate:");
+  if (!p)
+    return 0;
+  p += strlen("candidate:");
+
+  char foundation[64], transport[16], addr[64], typ[16];
+  unsigned prio;
+  int component;
+  if (sscanf(p, "%63s %d %15s %u %63s %d typ %15s", foundation, &component,
+             transport, &prio, addr, port, typ) != 7)
+    return 0;
+  if (strcmp(typ, "host") || strchr(addr, ':')) // IPv6 needs no port mapping
+    return 0;
+  if (!strncmp(addr, "127.", 4))
+    return 0;
+
+  snprintf(ip, (size_t)ipcap, "%s", addr);
+  return 1;
+}
+
+// Build the server-reflexive candidate the mapping just earned us, keeping the
+// component and transport from the real host candidate it is derived from.
+int net_mapped_candidate(const char *host_cand, const char *ext_ip, int ext_port,
+                         char *out, int cap) {
+  const char *p = strstr(host_cand, "candidate:");
+  if (!p)
+    return 0;
+  p += strlen("candidate:");
+
+  char foundation[64], transport[16], addr[64];
+  unsigned prio;
+  int component, port;
+  if (sscanf(p, "%63s %d %15s %u %63s %d", foundation, &component, transport,
+             &prio, addr, &port) != 6)
+    return 0;
+
+  // Distinct foundation, and the standard srflx priority so ICE still prefers
+  // a genuine host pair when one exists.
+  int n2 = snprintf(out, (size_t)cap,
+                    "%scandidate:map%s %d %s 1694498815 %s %d typ srflx "
+                    "raddr %s rport %d",
+                    strncmp(host_cand, "a=", 2) ? "" : "a=", foundation,
+                    component, transport, ext_ip, ext_port, addr, port);
+  return n2 > 0 && n2 < cap;
 }
 
 // ------------------------------------------------------------- SDP on one line ---
@@ -166,6 +241,8 @@ const char *net_route(const Net *n) {
     return "unknown";
   if (strstr(local, "typ relay") || strstr(remote, "typ relay"))
     return "relay";
+  if (strstr(local, "candidate:map") || strstr(remote, "candidate:map"))
+    return "port-mapped";
   if (strstr(local, "typ srflx") || strstr(remote, "typ srflx"))
     return "srflx";
   if (strstr(local, "typ host") && strstr(remote, "typ host"))
@@ -238,6 +315,39 @@ static int on_pipe_record(Net *n, const char *rec, int len, int connecting) {
     memcpy(cand, body, (size_t)blen);
     cand[blen] = '\0';
     signal_send(&n->sig, "CAND", cand);
+
+    // libjuice tells us the port it bound by publishing a host candidate, so
+    // there is no need to pin one in advance -- which also means two clients
+    // can share a machine.
+    if (!n->mapping_asked &&
+        net_parse_host_candidate(cand, n->host_ip, sizeof n->host_ip,
+                                 &n->host_port)) {
+      n->mapping_asked = 1;
+      snprintf(n->host_cand, sizeof n->host_cand, "%s", cand);
+
+      plum_mapping_t m = {.protocol = PLUM_IP_PROTOCOL_UDP,
+                          .internal_port = (uint16_t)n->host_port,
+                          .external_port = (uint16_t)n->host_port, // a hint
+                          .user_ptr = n};
+      n->mapping_id = plum_create_mapping(&m, on_mapping);
+    }
+    return 1;
+  }
+  case TAG_MAP: {
+    char line[PLUM_MAX_HOST_LEN + 16];
+    if (blen >= (int)sizeof line)
+      return 1;
+    memcpy(line, body, (size_t)blen);
+    line[blen] = '\0';
+
+    char ext_ip[PLUM_MAX_HOST_LEN];
+    int ext_port;
+    if (sscanf(line, "%255s %d", ext_ip, &ext_port) != 2)
+      return 1;
+
+    char cand[JUICE_MAX_CANDIDATE_SDP_STRING_LEN + 1];
+    if (net_mapped_candidate(n->host_cand, ext_ip, ext_port, cand, (int)sizeof cand))
+      signal_send(&n->sig, "CAND", cand); // one more path for the peer to try
     return 1;
   }
   case TAG_DONE:
@@ -351,6 +461,12 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
     goto fail;
   }
 
+  // Best effort. A router with none of PCP, NAT-PMP or UPnP just never calls
+  // back, and ICE carries on exactly as it did before.
+  n->mapping_id = -1;
+  plum_config_t pc = {.log_level = PLUM_LOG_LEVEL_NONE};
+  plum_init(&pc);
+
   if (cfg->ice_timeout_ms < 0)
     go_relay(n); // caller does not want a direct path at all
 
@@ -420,8 +536,12 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
   return 1;
 
 fail:
-  if (n->agent)
+  if (n->mapping_id > 0)
+    plum_destroy_mapping(n->mapping_id);
+  if (n->agent) {
+    plum_cleanup();
     juice_destroy(n->agent);
+  }
   signal_close(&n->sig);
   if (n->pipe[0] >= 0)
     close(n->pipe[0]);
@@ -517,6 +637,9 @@ int net_recv(Net *n, char *buf, int cap) {
 void net_close(Net *n) {
   if (!n)
     return;
+  if (n->mapping_id >= 0)
+    plum_destroy_mapping(n->mapping_id); // leaving a hole open would be rude
+  plum_cleanup();
   if (n->agent)
     juice_destroy(n->agent); // joins the juice thread before the pipe closes
   signal_close(&n->sig);

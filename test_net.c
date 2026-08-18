@@ -51,7 +51,57 @@ static void publish_code(const char *code, void *ctx) {
   close(code_out_fd);
 }
 
+// Pure string handling: no router, no server, no sockets.
+static int unit_tests(void) {
+  char ip[64], out[512];
+  int port;
+
+  assert(net_parse_host_candidate(
+      "a=candidate:1 1 UDP 2130706431 192.168.1.9 51234 typ host", ip,
+      sizeof ip, &port));
+  assert(!strcmp(ip, "192.168.1.9") && port == 51234);
+
+  // No "a=" prefix is equally valid.
+  assert(net_parse_host_candidate(
+      "candidate:2 1 UDP 2130706431 10.0.0.4 6000 typ host", ip, sizeof ip,
+      &port));
+  assert(!strcmp(ip, "10.0.0.4") && port == 6000);
+
+  // Nothing here is worth asking a router about.
+  assert(!net_parse_host_candidate(
+      "a=candidate:1 1 UDP 100 203.0.113.7 9 typ srflx", ip, sizeof ip, &port));
+  assert(!net_parse_host_candidate(
+      "a=candidate:1 1 UDP 100 fe80::1 9 typ host", ip, sizeof ip, &port));
+  assert(!net_parse_host_candidate(
+      "a=candidate:1 1 UDP 100 127.0.0.1 9 typ host", ip, sizeof ip, &port));
+  assert(!net_parse_host_candidate("garbage", ip, sizeof ip, &port));
+
+  assert(net_mapped_candidate(
+      "a=candidate:1 1 UDP 2130706431 192.168.1.9 51234 typ host", "203.0.113.7",
+      40000, out, sizeof out));
+  assert(!strcmp(out, "a=candidate:map1 1 UDP 1694498815 203.0.113.7 40000 "
+                      "typ srflx raddr 192.168.1.9 rport 51234"));
+
+  // The a= prefix is carried through, or not, exactly as it arrived.
+  assert(net_mapped_candidate(
+      "candidate:7 2 UDP 2130706431 10.0.0.4 6000 typ host", "198.51.100.2",
+      1234, out, sizeof out));
+  assert(!strncmp(out, "candidate:map7 2 UDP", 20));
+  assert(strstr(out, "rport 6000"));
+
+  assert(!net_mapped_candidate("nonsense", "1.2.3.4", 1, out, sizeof out));
+  assert(!net_mapped_candidate(
+      "a=candidate:1 1 UDP 2130706431 192.168.1.9 51234 typ host", "1.2.3.4", 1,
+      out, 20)); // refuses to emit a truncated candidate
+
+  printf("net unit tests ok\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "unit"))
+    return unit_tests();
+
   const char *port = argc > 1 ? argv[1] : "17779";
   // "relay": skip ICE entirely. A short timeout is not enough -- loopback ICE
   // completes in roughly a millisecond, so the race is not reliably lost.

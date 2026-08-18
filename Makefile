@@ -10,7 +10,7 @@ OBJ = $(GAME_OBJ) ui.o $(NET_OBJ) main.o
 
 # libjuice ships CMake config but no .pc file, so there is nothing for
 # pkg-config to find; the nix dev shell puts its -I/-L on the cc wrapper.
-LDLIBS = -ljuice
+LDLIBS = -ljuice -lplum
 
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDLIBS)
@@ -37,8 +37,9 @@ rendezvous: server/rendezvous.c
 
 TESTS = test_board test_proto
 
-test: $(TESTS)
+test: $(TESTS) test_net
 	@for t in $(TESTS); do ./$$t || exit 1; done
+	@./test_net unit
 
 test_board: board.o test_board.o
 	$(CC) $(CFLAGS) -o $@ $^
