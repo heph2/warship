@@ -28,6 +28,7 @@
 #include <libwebsockets.h>
 
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,7 @@ typedef struct Session {
   int room; // index into rooms, or -1
   int slot; // 0 or 1 within the room
   long long joined_at;
+  char peer_addr[64]; // captured on connect; lws cannot look it up post-close
 
   char in[MAX_MSG + 1]; // reassembly across websocket fragments
   size_t inlen;
@@ -82,6 +84,27 @@ static Room rooms[MAX_ROOMS];
 static struct lws_context *context;
 static lws_sorted_usec_list_t sweep_sul;
 static volatile sig_atomic_t interrupted;
+static int verbose = 0;
+
+// Room and connection lifecycle only: who connected, paired, left, and why a
+// room was refused or expired. Never the SIGNAL payload itself -- that is an
+// SDP description or ICE candidate carrying the players' real network
+// addresses, and this service has no business printing it even in -v.
+static void vlog(const char *fmt, ...) {
+  if (!verbose)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "[signal-server] ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+}
+
+// Best-effort label for a session in log lines: the peer address if lws will
+// give it to us without a reverse-DNS lookup, "?" otherwise. Never call this
+// after the socket starts closing -- lws_get_peer_simple() on a torn-down fd
+// logs its own ENOTCONN warning -- so Session caches it once at connect.
 
 static long long now_s(void) {
   struct timespec ts;
@@ -215,6 +238,7 @@ static void leave_room(Session *s) {
     send_msg(peer, "PEERGONE");
     lws_callback_on_writable(peer->wsi);
   }
+  vlog("room %s: closed (peer %s)", r->code, peer ? "notified" : "none");
 }
 
 static int code_ok(const char *s) {
@@ -251,11 +275,15 @@ static int handle_message(Session *s, char *msg) {
     }
     int ri = make_room(s);
     if (ri < 0) {
+      vlog("%s: CREATE refused, no rooms available",
+           s->peer_addr);
       fail(s, "no rooms available");
       return 1;
     }
     s->room = ri;
     s->slot = 0;
+    vlog("%s: created room %s", s->peer_addr,
+         rooms[ri].code);
     char reply[32];
     snprintf(reply, sizeof reply, "ROOM %s", rooms[ri].code);
     send_msg(s, reply);
@@ -274,16 +302,22 @@ static int handle_message(Session *s, char *msg) {
     }
     int ri = room_of_code(code);
     if (ri < 0) {
+      vlog("%s: JOIN %s refused, no such room",
+           s->peer_addr, code);
       fail(s, "no such room");
       return 1;
     }
     if (rooms[ri].peer[1]) {
+      vlog("%s: JOIN %s refused, room is full",
+           s->peer_addr, code);
       fail(s, "room is full");
       return 1;
     }
     rooms[ri].peer[1] = s;
     s->room = ri;
     s->slot = 1;
+    vlog("%s: joined room %s, pairing complete",
+         s->peer_addr, code);
     send_msg(rooms[ri].peer[0], "PEER host");
     send_msg(s, "PEER guest");
     return 1;
@@ -293,11 +327,17 @@ static int handle_message(Session *s, char *msg) {
     // Validate before anything else: a malformed payload is a protocol
     // violation whether or not there is currently someone to forward it to.
     if (!payload_ok(msg + 7)) {
+      vlog("%s: SIGNAL rejected, bad payload",
+           s->peer_addr);
       fail(s, "payload rejected");
       return 1;
     }
     Session *peer = other_peer(s);
     if (!peer) {
+      // Never logged with the payload: it is an SDP description or ICE
+      // candidate, i.e. the players' real network addresses.
+      vlog("%s: SIGNAL with no peer in room yet",
+           s->peer_addr);
       send_error(s, "no peer in room"); // recoverable: the peer may yet arrive
       return 1;
     }
@@ -328,6 +368,8 @@ static void sweep_cb(lws_sorted_usec_list_t *sul) {
     if (!expired)
       continue;
 
+    vlog("room %s: expired (%s, age %llds)", r->code,
+         lonely ? "lonely" : "lifetime", t - r->created_at);
     for (int k = 0; k < 2; k++) {
       if (!r->peer[k])
         continue;
@@ -346,12 +388,16 @@ static int callback_signaling(struct lws *wsi, enum lws_callback_reasons reason,
   Session *s = user;
 
   switch (reason) {
-  case LWS_CALLBACK_ESTABLISHED:
+  case LWS_CALLBACK_ESTABLISHED: {
     memset(s, 0, sizeof *s);
     s->wsi = wsi;
     s->room = -1;
     s->joined_at = now_s();
+    if (!lws_get_peer_simple(wsi, s->peer_addr, sizeof s->peer_addr))
+      snprintf(s->peer_addr, sizeof s->peer_addr, "?");
+    vlog("%s: connected", s->peer_addr);
     return 0;
+  }
 
   case LWS_CALLBACK_SERVER_WRITEABLE:
     drain_queue(s);
@@ -391,6 +437,8 @@ static int callback_signaling(struct lws *wsi, enum lws_callback_reasons reason,
   }
 
   case LWS_CALLBACK_CLOSED:
+    vlog("%s: disconnected%s", s->peer_addr,
+         s->room >= 0 ? " (still in a room)" : "");
     leave_room(s);
     free_queue(s);
     s->wsi = NULL;
@@ -445,10 +493,20 @@ static void on_signal(int sig) {
 
 int main(int argc, char **argv) {
   int port = 7777;
-  if (argc > 1) {
-    port = atoi(argv[1]);
+  int port_given = 0;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) {
+      verbose = 1;
+      continue;
+    }
+    if (port_given) {
+      fprintf(stderr, "usage: %s [-v] [port]\n", argv[0]);
+      return 1;
+    }
+    port = atoi(argv[i]);
+    port_given = 1;
     if (port < 1 || port > 65535) {
-      fprintf(stderr, "usage: %s [port]\n", argv[0]);
+      fprintf(stderr, "usage: %s [-v] [port]\n", argv[0]);
       return 1;
     }
   }

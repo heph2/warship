@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,11 +67,28 @@ struct Net {
 static int send_signal(Net *n, char tag, const char *body);
 
 static char last_err[256] = "";
+static int verbose = 0;
 
 const char *net_error(void) { return last_err; }
+void net_set_verbose(int v) { verbose = v; }
 
 static void set_err(const char *s) {
   snprintf(last_err, sizeof last_err, "%.*s", (int)sizeof last_err - 1, s);
+}
+
+// Same rule as signaling.c: stderr, never stdout, because ui.c owns the whole
+// screen and a stray line there would corrupt the next frame. This is called
+// only from the main thread (on_pipe_record, on_signal_msg, net_open), never
+// from a libjuice/libplum callback -- those may only write to the pipe.
+static void vlog(const char *fmt, ...) {
+  if (!verbose)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "[net] ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
 }
 
 static long long now_ms(void) {
@@ -232,6 +250,7 @@ static int on_signal_msg(Net *n, const char *msg, int *got_desc) {
              (int)sizeof n->signaling_reason - 1,
              msg[0] == 'P' ? "the other player left the signaling service"
                            : msg);
+    vlog("signaling done: %s", n->signaling_reason);
     return 1; // carry on: ICE may well finish with the candidates we have
   }
   if (strncmp(msg, "SIGNAL ", 7))
@@ -243,6 +262,7 @@ static int on_signal_msg(Net *n, const char *msg, int *got_desc) {
 
   switch (tag) {
   case SIG_DESC:
+    vlog("remote description received");
     if (juice_set_remote_description(n->agent, body) != 0) {
       set_err("the other player sent an unusable ICE description");
       return 0;
@@ -250,9 +270,11 @@ static int on_signal_msg(Net *n, const char *msg, int *got_desc) {
     *got_desc = 1;
     return 1;
   case SIG_CAND:
+    vlog("remote candidate: %s", body);
     juice_add_remote_candidate(n->agent, body); // a bad one is just ignored
     return 1;
   case SIG_DONE:
+    vlog("remote gathering done");
     juice_set_remote_gathering_done(n->agent);
     return 1;
   default:
@@ -273,6 +295,7 @@ static int on_pipe_record(Net *n, const char *rec, int len, int connecting) {
       return 1;
     memcpy(cand, body, (size_t)blen);
     cand[blen] = '\0';
+    vlog("local candidate: %s", cand);
     send_signal(n, SIG_CAND, cand);
 
     // libjuice tells us the port it bound by publishing a host candidate, so
@@ -305,25 +328,30 @@ static int on_pipe_record(Net *n, const char *rec, int len, int connecting) {
       return 1;
 
     char cand[JUICE_MAX_CANDIDATE_SDP_STRING_LEN + 1];
+    vlog("port mapping succeeded: %s", line);
     if (net_mapped_candidate(n->host_cand, ext_ip, ext_port, cand, (int)sizeof cand))
       send_signal(n, SIG_CAND, cand); // one more path for the peer to try
     return 1;
   }
   case TAG_DONE:
+    vlog("local gathering done");
     send_signal(n, SIG_DONE, "");
     return 1;
   case TAG_DATA:
     if (connecting)
       stash(n, body, blen); // peer got there first; do not lose the message
     return 1;
-  case TAG_STATE:
+  case TAG_STATE: {
+    juice_state_t st = (juice_state_t)atomic_load(&n->state);
+    vlog("ICE state: %s", juice_state_to_string(st));
     // Failure is reported, never worked around. If neither a direct path nor a
     // coturn allocation exists there is nowhere left to go.
-    if (atomic_load(&n->state) == JUICE_STATE_FAILED) {
+    if (st == JUICE_STATE_FAILED) {
       set_err("ICE failed: no direct path and no working TURN relay");
       return 0;
     }
     return 1;
+  }
   default:
     return 1;
   }
@@ -395,6 +423,7 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
     set_err(signal_error());
     goto fail;
   }
+  vlog("paired as %s, room %s", *is_host ? "host" : "guest", room_out);
 
   // SOCK_DGRAM, not SOCK_STREAM: record boundaries must survive, otherwise two
   // datagrams written by the juice thread would arrive glued together.
@@ -423,7 +452,13 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
     turn[i].port = (unsigned short)cfg->turn[i].port;
     turn[i].username = cfg->turn[i].user;
     turn[i].password = cfg->turn[i].pass;
+    // The password never appears here or anywhere else in this program.
+    vlog("turn server %s:%d (user %s)", turn[i].host, turn[i].port,
+         turn[i].username ? turn[i].username : "none");
   }
+  if (!nturn)
+    vlog("no turn server configured -- no relay fallback if direct paths fail");
+  vlog("stun server: %s", cfg->stun_host ? cfg->stun_host : "none");
   if (nturn) {
     jc.turn_servers = turn;
     jc.turn_servers_count = nturn;
@@ -498,6 +533,7 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
 
   // ICE has a path, so signaling has done its entire job. Closing here is what
   // guarantees no game packet can ever travel through it.
+  vlog("ICE completed, closing signaling");
   signal_close(n->sig);
   n->sig = NULL;
 
@@ -505,6 +541,7 @@ int net_open(Net **out, const NetConfig *cfg, char *room_out, int room_cap,
   return 1;
 
 fail:
+  vlog("net_open failed: %s", last_err);
   if (n->mapping_id > 0)
     plum_destroy_mapping(n->mapping_id);
   if (n->agent) {

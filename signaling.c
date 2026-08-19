@@ -4,6 +4,7 @@
 
 #include <libwebsockets.h>
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,11 +34,28 @@ struct Signal {
 };
 
 static char last_err[256] = "";
+static int verbose = 0;
 
 const char *signal_error(void) { return last_err; }
+void signal_set_verbose(int v) { verbose = v; }
 
 static void set_err(const char *s) {
   snprintf(last_err, sizeof last_err, "%.*s", (int)sizeof last_err - 1, s);
+}
+
+// stderr, not stdout: ui.c owns the whole screen with raw ANSI redraws, and a
+// stray line on stdout would corrupt the next frame. stderr survives that
+// untouched, and unbuffered so a hang shows its last line immediately rather
+// than sitting in libc's buffer.
+static void vlog(const char *fmt, ...) {
+  if (!verbose)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "[signal] ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
 }
 
 static long long now_ms(void) {
@@ -89,12 +107,14 @@ static int callback_signaling(struct lws *wsi, enum lws_callback_reasons reason,
   switch (reason) {
   case LWS_CALLBACK_CLIENT_ESTABLISHED:
     s->established = 1;
+    vlog("connected");
     if (s->outcount)
       lws_callback_on_writable(wsi);
     return 0;
 
   case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
     set_err(in ? (const char *)in : "signaling connection failed");
+    vlog("connect failed: %s", last_err);
     s->dead = 1;
     s->wsi = NULL;
     return -1;
@@ -115,11 +135,13 @@ static int callback_signaling(struct lws *wsi, enum lws_callback_reasons reason,
     if (!lws_is_final_fragment(wsi) || lws_remaining_packet_payload(wsi))
       return 0;
 
+    vlog("<- %.*s", (int)s->rxlen, s->rx);
     queue_in(s, s->rx, s->rxlen);
     s->rxlen = 0;
     return 0;
 
   case LWS_CALLBACK_CLIENT_CLOSED:
+    vlog("connection closed");
     s->dead = 1;
     s->wsi = NULL;
     return 0;
@@ -137,6 +159,7 @@ static const struct lws_protocols protocols[] = {
 // ------------------------------------------------------------------- api ---
 
 int signal_connect(Signal **out, const char *url, int timeout_ms) {
+  vlog("connecting to %s", url);
   Signal *s = calloc(1, sizeof *s);
   if (!s) {
     set_err("out of memory");
@@ -258,6 +281,7 @@ int signal_send(Signal *s, const char *msg) {
   memcpy(slot->buf + LWS_PRE, msg, len);
   slot->len = len;
   s->outcount++;
+  vlog("-> %s", msg);
 
   // Requesting writability from outside the event loop is not enough on its
   // own: lws has already computed its poll set and does not see the request

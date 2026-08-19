@@ -3,6 +3,7 @@
 #include "board.h"
 #include "net.h"
 #include "proto.h"
+#include "signaling.h"
 #include "ui.h"
 
 #include <errno.h>
@@ -355,6 +356,7 @@ static void usage(const char *argv0) {
           "  --turn-user USER       or $WARSHIP_TURN_USER\n"
           "  --turn-password PASS   or $WARSHIP_TURN_PASSWORD\n"
           "  --nick NAME\n"
+          "  -v, --verbose          trace signaling and ICE progress to stderr\n"
           "\n"
           "TURN needs a password and is skipped without one, which only costs\n"
           "you the relay of last resort. Read it from the environment rather\n"
@@ -403,6 +405,7 @@ int main(int argc, char **argv) {
   const char *turn_user = getenv("WARSHIP_TURN_USER");
   const char *turn_pass = getenv("WARSHIP_TURN_PASSWORD");
   const char *nick = "player";
+  int verbose = 0;
 
   for (; i < argc; i++) {
     const char *a = argv[i];
@@ -431,11 +434,16 @@ int main(int argc, char **argv) {
       turn_pass = argv[++i];
     } else if (!strcmp(a, "--nick") && val) {
       nick = argv[++i];
+    } else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) {
+      verbose = 1;
     } else {
       usage(argv[0]);
       return 1;
     }
   }
+
+  net_set_verbose(verbose);
+  signal_set_verbose(verbose);
 
   if (!turn_user)
     turn_user = DEFAULT_TURN_USER;

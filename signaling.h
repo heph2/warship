@@ -38,4 +38,8 @@ int signal_wait_peer(Signal *s, int *is_host, int timeout_ms);
 
 const char *signal_error(void);
 
+// Trace connects, sends and receives to stderr. Off by default; toggle before
+// signal_connect().
+void signal_set_verbose(int v);
+
 #endif

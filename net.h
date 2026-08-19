@@ -71,6 +71,11 @@ const char *net_route(const Net *n);
 void net_close(Net *n);
 const char *net_error(void);
 
+// Trace signaling and ICE progress to stderr: candidates as they are
+// gathered/received, state transitions, and whether TURN was configured.
+// Off by default; toggle before net_open().
+void net_set_verbose(int v);
+
 // Candidate rewriting, exposed because it is pure string handling and the one
 // part of the mapping path that can be tested without a router.
 int net_parse_host_candidate(const char *cand, char *ip, int ipcap, int *port);
